@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 import open3d as o3d
 from scipy.spatial.transform import Rotation
@@ -5,7 +6,6 @@ import cv2
 import matplotlib.pyplot as plt
 import copy
 from PIL import Image
-import torch
 import sys
 sys.path.append('core')
 import logging
@@ -14,7 +14,7 @@ import os
 import argparse
 from datetime import datetime
 from raft import RAFT
-from utils import flow_viz
+from flow_viz import flow_to_image
 from utils.utils import InputPadder
 
 from rlbench.action_modes.action_mode import MoveArmThenGripper
@@ -31,6 +31,8 @@ from torchvision import transforms as T
 import matplotlib.pyplot as plt
 
 import importlib
+
+counter = 0
 
 def load_image(imfile):
     img = np.array(imfile).astype(np.uint8)
@@ -139,6 +141,9 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         frame_range = range(keypoint_2, keypoint_1)
     else:
         frame_range = range(keypoint_1, keypoint_2)
+
+    #breakpoint()
+    print(frame_range)
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
@@ -148,14 +153,33 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
             obs_n = demo[idx].right_shoulder_rgb
         elif camera_view == 'overhead':
             obs_n = demo[idx].overhead_rgb
+
         # Use RAFT to get optical flow
         optical_flow = get_pred_flow(obs_1, obs_n)
+        optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
+
+        #breakpoint()
+        if idx % 2 == 0:
+            flo = flow_to_image(optical_flow_reshaped.cpu().numpy())
+            img_flo = np.concatenate([obs_1, flo], axis=0)
+            plt.imshow(img_flo / 255.0)
+            c = globals()["counter"]
+            if not os.path.exists(f"flow_predictions/{camera_view}"):
+                os.mkdir(f"flow_predictions/{camera_view}")
+            if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}"):
+                os.mkdir(f"flow_predictions/{camera_view}/{frame_range}")
+            if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}/task_frames"):
+                os.mkdir(f"flow_predictions/{camera_view}/{frame_range}/task_frames")
+            plt.savefig(f"flow_predictions/{camera_view}/{frame_range}/output-{c}.jpg")
+            cv2.imwrite(f'flow_predictions/{camera_view}/{frame_range}/task_frames/image-{c}.jpg', obs_n) # Save the image
+            globals()["counter"]+=1
+
         magnitudes = get_flow_magnitudes(optical_flow)
         # Zero out magnitudes of pixels that are part of the robot
         mag_no_robot = np.multiply(magnitudes, robot_seg)
         if mag_no_robot.max() > 0:
             mag_sum += mag_no_robot/np.max(mag_no_robot)
-
+    #breakpoint()
     norm_mag_sum = mag_sum/(len(demo)-1)
     kernel = np.ones((5, 5), np.uint8)
     ground_truth_seg_loose = (norm_mag_sum >= 0.001).astype(np.uint8)
@@ -190,30 +214,32 @@ def get_keypoint_pseudo_gt(demo, keypoint_1, keypoint_2):
     pcd = {'front': pcd_1, 'left_shoulder': pcd_2, 'right_shoulder': pcd_3, 'overhead': pcd_4}
     gt_mask = {'front': gt_mask_1, 'left_shoulder': gt_mask_2, 'right_shoulder': gt_mask_3, 'overhead': gt_mask_4}
     # Display RGB and pseudo ground truth
-    # plt.imshow(rgb_1)
-    # plt.imshow(pseudo_gt_seg_1_l, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_front_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_2)
-    # plt.imshow(pseudo_gt_seg_2_l, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_left_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_3)
-    # plt.imshow(pseudo_gt_seg_3_l, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_right_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_4)
-    # plt.imshow(pseudo_gt_seg_4_l, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_overhead_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_1)
-    # plt.imshow(pseudo_gt_seg_1_t, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_front_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_2)
-    # plt.imshow(pseudo_gt_seg_2_t, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_left_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_3)
-    # plt.imshow(pseudo_gt_seg_3_t, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_right_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    # plt.imshow(rgb_4)
-    # plt.imshow(pseudo_gt_seg_4_t, alpha=0.5)
-    # plt.savefig('./test-frames/pseudo_gt_overhead_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_1)
+    plt.imshow(pseudo_gt_seg_1_l, alpha=0.5)
+    if not os.path.exists(f"./test-frames"):
+                os.mkdir(f"./test-frames")
+    plt.savefig('./test-frames/pseudo_gt_front_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_2)
+    plt.imshow(pseudo_gt_seg_2_l, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_left_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_3)
+    plt.imshow(pseudo_gt_seg_3_l, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_right_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_4)
+    plt.imshow(pseudo_gt_seg_4_l, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_overhead_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_1)
+    plt.imshow(pseudo_gt_seg_1_t, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_front_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_2)
+    plt.imshow(pseudo_gt_seg_2_t, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_left_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_3)
+    plt.imshow(pseudo_gt_seg_3_t, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_right_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.imshow(rgb_4)
+    plt.imshow(pseudo_gt_seg_4_t, alpha=0.5)
+    plt.savefig('./test-frames/pseudo_gt_overhead_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
 
     return pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask
     
@@ -229,10 +255,11 @@ if __name__ == '__main__':
         if hasattr(obj, '__class__') and obj.__class__.__name__ == 'type':
             TASKS.append(obj)
     DEVICE = 'cuda'
-    START_RANGE = 0
-    END_RANGE = 27
+    START_RANGE = 70
+    END_RANGE = 85
     # Intervals for all RLBench Tasks (0,27) (27,54) (54,80) (80,106)s
-    TASKS = TASKS[START_RANGE:END_RANGE]
+    # breakpoint()
+    TASKS = TASKS[60:61]
     # TASKS = [PhoneOnBase, StackWine, InsertOntoSquarePeg, PlaceShapeInShapeSorter, CloseBox, PlaceCups, SweepToDustpan, OpenDoor, HitBallWithQueue, ScoopWithSpatula, InsertUsbInComputer]
     print(TASKS)
     SAMPLES = 15
