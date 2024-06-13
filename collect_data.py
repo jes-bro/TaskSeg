@@ -138,12 +138,9 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
 
     # Get pseudo-ground truth segmentation
     if keypoint_1 > keypoint_2:
-        frame_range = range(keypoint_2, keypoint_1)
+        frame_range = range(keypoint_2, keypoint_1) # Unused in current implementation (if we ever wanted to aggreegate flow in reverse direction)
     else:
-        frame_range = range(keypoint_1, keypoint_2)
-
-    #breakpoint()
-    print(frame_range)
+        frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
@@ -179,8 +176,8 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         mag_no_robot = np.multiply(magnitudes, robot_seg)
         if mag_no_robot.max() > 0:
             mag_sum += mag_no_robot/np.max(mag_no_robot)
-    #breakpoint()
-    norm_mag_sum = mag_sum/(len(demo)-1)
+
+    norm_mag_sum = mag_sum/(len(frame_range))
     kernel = np.ones((5, 5), np.uint8)
     ground_truth_seg_loose = (norm_mag_sum >= 0.001).astype(np.uint8)
     ground_truth_seg_tight = (norm_mag_sum >= 0.05).astype(np.uint8)
