@@ -11,10 +11,11 @@ sys.path.append('core')
 import logging
 import glob
 import os
+import subprocess
 import argparse
 from datetime import datetime
 from raft import RAFT
-from flow_viz import flow_to_image
+from flow_viz import flow_to_image_sequential, get_max_flow_singular
 from utils.utils import InputPadder
 
 from rlbench.action_modes.action_mode import MoveArmThenGripper
@@ -141,6 +142,25 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         frame_range = range(keypoint_2, keypoint_1) # Unused in current implementation (if we ever wanted to aggreegate flow in reverse direction)
     else:
         frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
+    
+    max_flow_magnitude = -1000
+    for idx in frame_range:
+        if camera_view == 'front':
+            obs_n = demo[idx].front_rgb
+        elif camera_view == 'left_shoulder':
+            obs_n = demo[idx].left_shoulder_rgb
+        elif camera_view == 'right_shoulder':
+            obs_n = demo[idx].right_shoulder_rgb
+        elif camera_view == 'overhead':
+            obs_n = demo[idx].overhead_rgb
+
+        # Use RAFT to get optical flow
+        optical_flow = get_pred_flow(obs_1, obs_n)
+        optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
+        current_max_flow_mag = get_max_flow_singular(optical_flow_reshaped.cpu().numpy())
+        if current_max_flow_mag > max_flow_magnitude:
+            max_flow_magnitude = current_max_flow_mag
+    #breakpoint()
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
@@ -155,21 +175,31 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         optical_flow = get_pred_flow(obs_1, obs_n)
         optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
 
-        #breakpoint()
-        if idx % 2 == 0:
-            flo = flow_to_image(optical_flow_reshaped.cpu().numpy())
-            img_flo = np.concatenate([obs_1, flo], axis=0)
-            plt.imshow(img_flo / 255.0)
-            c = globals()["counter"]
-            if not os.path.exists(f"flow_predictions/{camera_view}"):
-                os.mkdir(f"flow_predictions/{camera_view}")
-            if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}"):
-                os.mkdir(f"flow_predictions/{camera_view}/{frame_range}")
-            if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}/task_frames"):
-                os.mkdir(f"flow_predictions/{camera_view}/{frame_range}/task_frames")
-            plt.savefig(f"flow_predictions/{camera_view}/{frame_range}/output-{c}.jpg")
-            cv2.imwrite(f'flow_predictions/{camera_view}/{frame_range}/task_frames/image-{c}.jpg', obs_n) # Save the image
-            globals()["counter"]+=1
+        ax1 = plt.subplot2grid((2, 4), (0, 0), colspan=2)
+        ax2 = plt.subplot2grid((2, 4), (0, 2), colspan=2)
+        ax3 = plt.subplot2grid((2, 4), (1, 1), colspan=2)
+
+        # Display images
+        ax1.imshow(obs_1)
+        ax1.set_title("obs 1")
+        ax1.axis('off')  # Hide axes
+        ax2.imshow(obs_n)
+        ax2.set_title("obs n")
+        ax2.axis('off')  # Hide axes
+        flo = flow_to_image_sequential(optical_flow_reshaped.cpu().numpy(), max_flow_magnitude)
+        ax3.imshow(flo / 255.0)
+        ax3.set_title("predicted flow")
+        ax3.axis('off')  # Hide axes
+        c = globals()["counter"]
+        if not os.path.exists(f"flow_predictions/{camera_view}"):
+            os.mkdir(f"flow_predictions/{camera_view}")
+        if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}"):
+            os.mkdir(f"flow_predictions/{camera_view}/{frame_range}")
+        if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}/task_frames"):
+            os.mkdir(f"flow_predictions/{camera_view}/{frame_range}/task_frames")
+        plt.savefig(f"flow_predictions/{camera_view}/{frame_range}/output-{c}.jpg")
+        globals()["counter"]+=1
+        plt.clf()
 
         magnitudes = get_flow_magnitudes(optical_flow)
         # Zero out magnitudes of pixels that are part of the robot
@@ -193,11 +223,79 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
                 dilated_gt_seg_loose[i][j] = 0  
                 dilated_gt_seg_tight[i][j] = 0
     
+    fig = plt.figure(figsize=(15,25))
+    ax1 = plt.subplot2grid((6, 2), (0, 0), colspan=1)
+    ax2 = plt.subplot2grid((6, 2), (0, 1), colspan=1)
+    ax3 = plt.subplot2grid((6, 2), (1, 0), colspan=1)
+    ax4 = plt.subplot2grid((6, 2), (1, 1), colspan=1)
+    ax5 = plt.subplot2grid((6, 2), (2, 0), colspan=1)
+    ax6 = plt.subplot2grid((6, 2), (2, 1), colspan=1)
+    ax7 = plt.subplot2grid((6, 2), (3, 0), colspan=1)
+    ax8 = plt.subplot2grid((6, 2), (3, 1), colspan=1)
+    ax9 = plt.subplot2grid((6, 2), (4, 0), colspan=1)
+    ax10 = plt.subplot2grid((6, 2), (4, 1), colspan=1)
+    # Display images
+    # Display images
+    ax2.imshow(magnitudes)
+    ax2.set_title("magnitudes")
+    ax2.axis('off')  # Hide axes
+    ax3.imshow(mag_sum)
+    ax3.set_title("mag sum")
+    ax3.axis('off')  # Hide axes
+    ax1.imshow(robot_seg)
+    ax1.set_title("robot seg")
+    ax1.axis('off')  # Hide axes
+    ax4.imshow(norm_mag_sum)
+    ax4.set_title("norm mag sum")
+    ax4.axis('off')  # Hide axes
+    ax5.imshow(ground_truth_seg_loose)
+    ax5.set_title("gt seg loose")
+    ax5.axis('off')  # Hide axes
+    ax6.imshow(ground_truth_seg_tight)
+    ax6.set_title("gt seg tight")
+    ax6.axis('off')  # Hide axes
+    ax7.imshow(eroded_gt_seg_loose)
+    ax7.set_title("eroded gt seg loose")
+    ax7.axis('off')  # Hide axes
+    ax8.imshow(dilated_gt_seg_loose)
+    ax8.set_title("dilated gt seg loose")
+    ax8.axis('off')  # Hide axes
+    ax9.imshow(eroded_gt_seg_tight)
+    ax9.set_title("eroded gt seg tight")
+    ax9.axis('off')  # Hide axes
+    ax10.imshow(dilated_gt_seg_tight)
+    ax10.set_title("dilated gt seg tight")
+    ax10.axis('off')  # Hide axes
+
+    c = globals()["counter"]
+    if not os.path.exists(f"flow_predictions/{camera_view}"):
+        os.mkdir(f"flow_predictions/{camera_view}")
+    if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}"):
+        os.mkdir(f"flow_predictions/{camera_view}/{frame_range}")
+    if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}/task_frames"):
+        os.mkdir(f"flow_predictions/{camera_view}/{frame_range}/task_frames")
+    plt.savefig(f"flow_predictions/{camera_view}/{frame_range}/masking-{c}.jpg")
+    cv2.imwrite(f'flow_predictions/{camera_view}/{frame_range}/task_frames/image-{c}.jpg', obs_n) # Save the image
+    globals()["counter"]+=1
+    plt.clf()
+    
     # Find connected component closest to gripper position
     final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, pcd_1)
     final_gt_seg_t = connected_components(dilated_gt_seg_tight, gripper_pos, pcd_1)
 
+    if not os.path.exists(f"flow_predictions/{camera_view}/{frame_range}/pseudo_gts"):
+        os.mkdir(f"flow_predictions/{camera_view}/{frame_range}/pseudo_gts")
+    plot_segmentations(obs_1, final_gt_seg_l, camera_view, frame_range, "l")
+    plot_segmentations(obs_1, final_gt_seg_t, camera_view, frame_range, "t")
+
     return final_gt_seg_l, final_gt_seg_t, obs_1, depth_1, pcd_1, gt_mask
+
+def plot_segmentations(obs, seg, camera_view, frame_range, t_or_l):
+    plt.imshow(obs)
+    plt.imshow(seg, alpha=0.5)
+    plt.savefig(f'flow_predictions/{camera_view}/{frame_range}/pseudo_gts/pseudo_gt_{camera_view}_{t_or_l}'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    plt.clf()
+
 
 def get_keypoint_pseudo_gt(demo, keypoint_1, keypoint_2):
     pseudo_gt_seg_1_l, pseudo_gt_seg_1_t, rgb_1, depth_1, pcd_1, gt_mask_1 = generate_pseudo_gt(demo, keypoint_1, keypoint_2, 'front')
@@ -211,32 +309,32 @@ def get_keypoint_pseudo_gt(demo, keypoint_1, keypoint_2):
     pcd = {'front': pcd_1, 'left_shoulder': pcd_2, 'right_shoulder': pcd_3, 'overhead': pcd_4}
     gt_mask = {'front': gt_mask_1, 'left_shoulder': gt_mask_2, 'right_shoulder': gt_mask_3, 'overhead': gt_mask_4}
     # Display RGB and pseudo ground truth
-    plt.imshow(rgb_1)
-    plt.imshow(pseudo_gt_seg_1_l, alpha=0.5)
-    if not os.path.exists(f"./test-frames"):
-                os.mkdir(f"./test-frames")
-    plt.savefig('./test-frames/pseudo_gt_front_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_2)
-    plt.imshow(pseudo_gt_seg_2_l, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_left_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_3)
-    plt.imshow(pseudo_gt_seg_3_l, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_right_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_4)
-    plt.imshow(pseudo_gt_seg_4_l, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_overhead_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_1)
-    plt.imshow(pseudo_gt_seg_1_t, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_front_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_2)
-    plt.imshow(pseudo_gt_seg_2_t, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_left_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_3)
-    plt.imshow(pseudo_gt_seg_3_t, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_right_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
-    plt.imshow(rgb_4)
-    plt.imshow(pseudo_gt_seg_4_t, alpha=0.5)
-    plt.savefig('./test-frames/pseudo_gt_overhead_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_1)
+    # plt.imshow(pseudo_gt_seg_1_l, alpha=0.5)
+    # if not os.path.exists(f"./test-frames"):
+    #             os.mkdir(f"./test-frames")
+    # plt.savefig('./test-frames/pseudo_gt_front_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_2)
+    # plt.imshow(pseudo_gt_seg_2_l, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_left_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_3)
+    # plt.imshow(pseudo_gt_seg_3_l, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_right_shoulder_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_4)
+    # plt.imshow(pseudo_gt_seg_4_l, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_overhead_l'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_1)
+    # plt.imshow(pseudo_gt_seg_1_t, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_front_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_2)
+    # plt.imshow(pseudo_gt_seg_2_t, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_left_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_3)
+    # plt.imshow(pseudo_gt_seg_3_t, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_right_shoulder_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
+    # plt.imshow(rgb_4)
+    # plt.imshow(pseudo_gt_seg_4_t, alpha=0.5)
+    # plt.savefig('./test-frames/pseudo_gt_overhead_t'+str(datetime.now())+'.png',bbox_inches='tight', pad_inches=0)
 
     return pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask
     
@@ -255,8 +353,10 @@ if __name__ == '__main__':
     START_RANGE = 70
     END_RANGE = 85
     # Intervals for all RLBench Tasks (0,27) (27,54) (54,80) (80,106)s
-    # breakpoint()
-    TASKS = TASKS[60:61]
+    # 
+    # 
+    breakpoint()
+    # TASKS = TASKS[95:96]
     # TASKS = [PhoneOnBase, StackWine, InsertOntoSquarePeg, PlaceShapeInShapeSorter, CloseBox, PlaceCups, SweepToDustpan, OpenDoor, HitBallWithQueue, ScoopWithSpatula, InsertUsbInComputer]
     print(TASKS)
     SAMPLES = 15
@@ -264,7 +364,7 @@ if __name__ == '__main__':
     start_time = datetime.now()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='models/raft-sintel.pth', help="restore checkpoint")
+    parser.add_argument('--model', default='models/raft-things.pth', help="restore checkpoint")
     parser.add_argument('--small', action='store_true', help='use small model')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
