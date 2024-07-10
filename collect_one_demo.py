@@ -67,33 +67,7 @@ def get_pred_flow_sequence_normalized(obs_1, obs_2, max_flow):
         # print("rad_average", np.average(rad)) # stack wine 3.681587
         epsilon = 1e-5
         u = u / (max_flow + epsilon)
-        v = v / (max_flow + epsilon)
-        optical_flow_reshaped[:,:,0] = u
-        optical_flow_reshaped[:,:,1] = v
         return optical_flow_reshaped
-    
-def get_seq_norm_flow(flow, max_flow):
-    optical_flow_reshaped = flow.squeeze().permute(1, 2, 0)
-    u = optical_flow_reshaped[:,:,0]
-    v = optical_flow_reshaped[:,:,1]
-    # print("rad_max",rad_max) # stack wine 85.07742
-    # print("rad_average", np.average(rad)) # stack wine 3.681587
-    epsilon = 1e-5
-    u = u / (max_flow + epsilon)
-    v = v / (max_flow + epsilon)
-    return optical_flow_reshaped
-
-def get_frame_norm_flow(flow):
-    optical_flow_reshaped = flow.squeeze().permute(1, 2, 0)
-    u = optical_flow_reshaped[:,:,0]
-    v = optical_flow_reshaped[:,:,1]
-    # print("rad_max",rad_max) # stack wine 85.07742
-    # print("rad_average", np.average(rad)) # stack wine 3.681587
-    max_flow = get_max_flow_singular(optical_flow_reshaped)
-    epsilon = 1e-5
-    u = u / (max_flow + epsilon)
-    v = v / (max_flow + epsilon)
-    return optical_flow_reshaped
 
 def get_flow_magnitudes(flow):
     # flow = flow.permute(1,2,0).cpu().numpy()
@@ -130,7 +104,7 @@ def keypoint_discovery(demo: Demo, stopping_delta=0.1) -> List[int]:
         episode_keypoints.pop(-2)
     return episode_keypoints
 
-def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1):
+def connected_components(dilated_gt_seg, gripper_pos, pcd, max_distance = 0.1):
     # Use connected components to get closest segments to gripper
     num_labels, labeled_image = cv2.connectedComponents(dilated_gt_seg)
     close_segments = []
@@ -138,7 +112,7 @@ def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1)
         connected_component = np.column_stack(np.where(labeled_image == label))
         for point in connected_component:
             # Calculate the distance between the gripper and point cloud of pixel
-            distance = np.linalg.norm(gripper_pos - image[0][1])
+            distance = np.linalg.norm(gripper_pos - pcd[point[0]][point[1]])
             if distance <= max_distance:
                 close_segments.append(label)
                 break
@@ -179,7 +153,6 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     robot_seg[robot_seg<30] = 1
     robot_seg[robot_seg!=1] = 0
     mag_sum = np.zeros((obs_1.shape[0], obs_1.shape[1]))
-    # breakpoint()
 
     # Get pseudo-ground truth segmentation
     if keypoint_1 > keypoint_2:
@@ -187,7 +160,14 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     else:
         frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
 
-    max_flow = -1000
+    # Save robot segmentation
+    fstop = frame_range.stop - 1
+    category_name = f"OPENDOOR-same-{camera_view}-{frame_range.start}-{fstop}"
+    value = 0
+    robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
+    os.makedirs(robot_save_dir, exist_ok=True) 
+    np.save(os.path.join(robot_save_dir, f'{value:05}.npy'), robot_seg)
+
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
@@ -199,147 +179,27 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
             obs_n = demo[idx].overhead_rgb
         # Use RAFT to get optical flow
         optical_flow = get_pred_flow(obs_1, obs_n)
-        print("Saving flow reg")
-        optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
-        max_flow_sing = get_max_flow_singular(optical_flow_reshaped.cpu().numpy())
-        if max_flow_sing > max_flow:
-            max_flow = max_flow_sing
-
-    for idx in frame_range:
-        if camera_view == 'front':
-            obs_n = demo[idx].front_rgb
-        elif camera_view == 'left_shoulder':
-            obs_n = demo[idx].left_shoulder_rgb
-        elif camera_view == 'right_shoulder':
-            obs_n = demo[idx].right_shoulder_rgb
-        elif camera_view == 'overhead':
-            obs_n = demo[idx].overhead_rgb
-        # Use RAFT to get optical flow
-        optical_flow = get_pred_flow_sequence_normalized(obs_1, obs_n, max_flow)
-        magnitudes = get_flow_magnitudes(optical_flow.cpu().numpy())
-        # Zero out magnitudes of pixels that are part of the robot
-        mag_no_robot = np.multiply(magnitudes, robot_seg)
-        if mag_no_robot.max() > 0:
-            mag_sum += mag_no_robot/np.max(mag_no_robot)
-        fstop = frame_range.stop - 1
-        category_name = f"WINE3-{camera_view}-{frame_range.start}-{fstop}"
+        optical_flow = optical_flow.squeeze().permute(1, 2, 0)
 
         # Save RGB image 
         value = idx - frame_range.start
-        rgb_save_dir = os.path.join('tsg', 'JPEGImages', category_name) 
+        rgb_save_dir = os.path.join('tsg', 'jpgs', category_name) 
         os.makedirs(rgb_save_dir, exist_ok=True) 
         plt.imsave(os.path.join(rgb_save_dir, f'{value:05}.jpg'), obs_n) 
         plt.clf()
 
-        # Save Flow image 
-        flow_save_dir = os.path.join('tsg', f'FlowImages_gap1_to_k', category_name) 
+        # Save Flow
+        flow_save_dir = os.path.join('tsg', f'non_normalized_flow', category_name) 
         os.makedirs(flow_save_dir, exist_ok=True) 
         print("Saving flow seq")
-        flo = flow_to_image(optical_flow.cpu().numpy())
-        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.png'), flo / 255.0)
+        np.save(os.path.join(flow_save_dir, f'{value:05}.npy'), optical_flow.cpu().numpy())
+        flow_save_dir = os.path.join('tsg', f'non_normalized_flow_imgs', category_name) 
+        os.makedirs(flow_save_dir, exist_ok=True) 
+        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), flow_to_image(optical_flow.cpu().numpy())) 
         plt.clf()
 
-    mag_save_dir = os.path.join('tsg', f'magnitudes', category_name) 
-    os.makedirs(mag_save_dir, exist_ok=True) 
-    plt.imsave(os.path.join(mag_save_dir, f'{value:05}.png'), mag_sum)
-    plt.clf()
-
-    norm_mag_sum = mag_sum / len(frame_range)
-    mag_norm_save_dir = os.path.join('tsg', f'norm_magnitudes', category_name) 
-    os.makedirs(mag_norm_save_dir, exist_ok=True) 
-    plt.imsave(os.path.join(mag_norm_save_dir, f'{value:05}.png'), norm_mag_sum)
-    plt.clf()
-
-    data = norm_mag_sum.flatten()
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(data, bins=100, edgecolor='black')
-    plt.title('Histogram of Magnitudes')
-    plt.xlabel('Magnitude')
-    plt.ylabel('Frequency (Log Scale)')
-    plt.grid(True)
-
-    hist_save_dir = os.path.join('tsg', f'hist', category_name) 
-    os.makedirs(hist_save_dir, exist_ok=True) 
-    plt.savefig(os.path.join(hist_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    plt.figure(figsize=(8, 6))
-    heatmap = plt.imshow(norm_mag_sum, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar(heatmap)
-    cbar.set_label('Magnitude')
-    ticks = np.linspace(np.min(norm_mag_sum), np.max(norm_mag_sum), num=40)
-    cbar.set_ticks(ticks)
-    cbar.set_ticklabels([f"{tick:.2f}" for tick in ticks])
-    plt.title('Magnitude Heatmap')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    heatmap_save_dir = os.path.join('tsg', f'norm_magnitudes_heat', category_name) 
-    os.makedirs(heatmap_save_dir, exist_ok=True) 
-    plt.savefig(os.path.join(heatmap_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    mean = np.mean(norm_mag_sum)
-    std = np.std(norm_mag_sum)
-    deviation = (norm_mag_sum - mean) / std
-
-    plt.figure(figsize=(8, 6))
-    heatmap2 = plt.imshow(deviation, cmap='coolwarm', interpolation='nearest')
-
-    cbar = plt.colorbar(heatmap2)
-    cbar.set_label('Standard Deviations from Mean')
-    ticks = [-3, -2, -1, 0, 1, 2, 3]
-    cbar.set_ticks(ticks)
-    tick_labels = ['99.7% (-3σ)', '95% (-2σ)', '68% (-1σ)', 'Mean (0σ)', '68% (+1σ)', '95% (+2σ)', '99.7% (+3σ)']
-    cbar.set_ticklabels(tick_labels)
-
-    plt.title('Deviation from Mean')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-
-    heatmap2_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std', category_name)
-    os.makedirs(heatmap2_save_dir, exist_ok=True)
-    plt.savefig(os.path.join(heatmap2_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    mean = np.mean(norm_mag_sum)
-    std = np.std(norm_mag_sum)
-    threshold_low = mean + 3 * std
-    norm_mag_sum_clipped = np.where((norm_mag_sum < threshold_low), 0, norm_mag_sum)
-    heatmap = plt.imshow(norm_mag_sum_clipped, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar(heatmap)
-
-    cbar.set_label('Flow Magnitude (clipped)')
-
-    plt.title('Flow Heatmap with Values Below Mean Zeroed Out')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    clip_std_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std_clipped', category_name)
-    os.makedirs(clip_std_save_dir, exist_ok=True)
-    plt.savefig(os.path.join(clip_std_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    kernel = np.ones((5, 5), np.uint8)
-    ground_truth_seg_loose = (norm_mag_sum_clipped >= mean).astype(np.uint8)
-    ground_truth_seg_tight = (norm_mag_sum_clipped >= mean).astype(np.uint8)
-    eroded_gt_seg_loose = cv2.erode(ground_truth_seg_loose, kernel, iterations=1)
-    dilated_gt_seg_loose = cv2.dilate(eroded_gt_seg_loose, kernel, iterations=1)
-    eroded_gt_seg_tight = cv2.erode(ground_truth_seg_tight, kernel, iterations=1)
-    dilated_gt_seg_tight = cv2.dilate(eroded_gt_seg_tight, kernel, iterations=1)
-
-    # Ensure all parts of segmentation in workspace with point cloud
-    for i in range(ground_truth_seg_loose.shape[0]):
-        for j in range(ground_truth_seg_loose.shape[1]):
-            if pcd_1[i][j][0] < -0.6 or pcd_1[i][j][0] > 0.6 or pcd_1[i][j][1] < -0.6 or pcd_1[i][j][1] > 0.6 or pcd_1[i][j][2] < 0.7525: #-0.5, 0.52, -0.55, 0.55
-                dilated_gt_seg_loose[i][j] = 0  
-                dilated_gt_seg_tight[i][j] = 0
-    
-    # Find connected component closest to gripper position
-    final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, pcd_1)
-    final_gt_seg_t = connected_components(dilated_gt_seg_tight, gripper_pos, pcd_1)
-
-    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "l")
-    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "t")
+    final_gt_seg_l = 1
+    final_gt_seg_t = 1
 
     return final_gt_seg_l, final_gt_seg_t, obs_1, depth_1, pcd_1, gt_mask
 

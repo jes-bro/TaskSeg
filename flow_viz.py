@@ -181,3 +181,28 @@ def get_max_flow_singular(flow_uv, clip_flow=None, convert_to_bgr=False):
     # print("rad_max",rad_max) # stack wine 85.07742
     # print("rad_average", np.average(rad)) # stack wine 3.681587
     return rad_max
+
+def flow_to_image(flow_uv, clip_flow=None, convert_to_bgr=False):
+    """
+    Expects a two dimensional flow image of shape.
+
+    Args:
+        flow_uv (np.ndarray): Flow UV image of shape [H,W,2]
+        clip_flow (float, optional): Clip maximum of flow values. Defaults to None.
+        convert_to_bgr (bool, optional): Convert output image to BGR. Defaults to False.
+
+    Returns:
+        np.ndarray: Flow visualization image of shape [H,W,3]
+    """
+    assert flow_uv.ndim == 3, 'input flow must have three dimensions'
+    assert flow_uv.shape[2] == 2, 'input flow must have shape [H,W,2]'
+    if clip_flow is not None:
+        flow_uv = np.clip(flow_uv, 0, clip_flow)
+    u = flow_uv[:,:,0]
+    v = flow_uv[:,:,1]
+    rad = np.sqrt(np.square(u) + np.square(v))
+    rad_max = np.max(rad)
+    epsilon = 1e-5
+    # u = u / (rad_max + epsilon)
+    # v = v / (rad_max + epsilon)
+    return flow_uv_to_colors(u, v, convert_to_bgr)
