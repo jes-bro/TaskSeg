@@ -4,7 +4,9 @@ from scipy.spatial.transform import Rotation
 import cv2
 import matplotlib.pyplot as plt
 import copy
+import gc
 from PIL import Image
+import importlib
 import torch
 import sys
 sys.path.append('core')
@@ -13,7 +15,8 @@ import glob
 import os
 import argparse
 from datetime import datetime
-from raft import RAFT
+import RAFT3D.raft3d as RAFT3d
+import RAFT3D.raft3d.projective_ops as pops
 from flow_viz import flow_to_image, get_max_flow_singular, flow_to_image_sequential
 from utils import flow_viz
 from utils.utils import InputPadder
@@ -67,33 +70,7 @@ def get_pred_flow_sequence_normalized(obs_1, obs_2, max_flow):
         # print("rad_average", np.average(rad)) # stack wine 3.681587
         epsilon = 1e-5
         u = u / (max_flow + epsilon)
-        v = v / (max_flow + epsilon)
-        optical_flow_reshaped[:,:,0] = u
-        optical_flow_reshaped[:,:,1] = v
         return optical_flow_reshaped
-    
-def get_seq_norm_flow(flow, max_flow):
-    optical_flow_reshaped = flow.squeeze().permute(1, 2, 0)
-    u = optical_flow_reshaped[:,:,0]
-    v = optical_flow_reshaped[:,:,1]
-    # print("rad_max",rad_max) # stack wine 85.07742
-    # print("rad_average", np.average(rad)) # stack wine 3.681587
-    epsilon = 1e-5
-    u = u / (max_flow + epsilon)
-    v = v / (max_flow + epsilon)
-    return optical_flow_reshaped
-
-def get_frame_norm_flow(flow):
-    optical_flow_reshaped = flow.squeeze().permute(1, 2, 0)
-    u = optical_flow_reshaped[:,:,0]
-    v = optical_flow_reshaped[:,:,1]
-    # print("rad_max",rad_max) # stack wine 85.07742
-    # print("rad_average", np.average(rad)) # stack wine 3.681587
-    max_flow = get_max_flow_singular(optical_flow_reshaped)
-    epsilon = 1e-5
-    u = u / (max_flow + epsilon)
-    v = v / (max_flow + epsilon)
-    return optical_flow_reshaped
 
 def get_flow_magnitudes(flow):
     # flow = flow.permute(1,2,0).cpu().numpy()
@@ -130,7 +107,7 @@ def keypoint_discovery(demo: Demo, stopping_delta=0.1) -> List[int]:
         episode_keypoints.pop(-2)
     return episode_keypoints
 
-def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1):
+def connected_components(dilated_gt_seg, gripper_pos, pcd, max_distance = 0.1):
     # Use connected components to get closest segments to gripper
     num_labels, labeled_image = cv2.connectedComponents(dilated_gt_seg)
     close_segments = []
@@ -138,7 +115,7 @@ def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1)
         connected_component = np.column_stack(np.where(labeled_image == label))
         for point in connected_component:
             # Calculate the distance between the gripper and point cloud of pixel
-            distance = np.linalg.norm(gripper_pos - image[0][1])
+            distance = np.linalg.norm(gripper_pos - pcd[point[0]][point[1]])
             if distance <= max_distance:
                 close_segments.append(label)
                 break
@@ -149,6 +126,30 @@ def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1)
     for label in close_segments:
         final_gt_seg_1[labeled_image == label] = 1
     return final_gt_seg_1
+
+import torch.nn.functional as F
+from RAFT3D.scripts.utils import show_image, normalize_image
+DEPTH_SCALE = 0.2
+
+def prepare_images_and_depths(image1, image2, depth1, depth2):
+    """ padding, normalization, and scaling """
+
+    print(f"Original depth1 shape: {depth1.shape}")
+    print(f"Original depth2 shape: {depth2.shape}")
+
+    image1 = F.pad(image1, [0,0,0,0], mode='replicate')
+    image2 = F.pad(image2, [0,0,0,0], mode='replicate')
+    depth1 = F.pad(depth1[:,None], [0,0,0,0], mode='replicate')[:,0]
+    depth2 = F.pad(depth2[:,None], [0,0,0,0], mode='replicate')[:,0]
+    
+    depth1 = (DEPTH_SCALE * depth1).float()
+    depth2 = (DEPTH_SCALE * depth2).float()
+    image1 = normalize_image(image1)
+    image2 = normalize_image(image2)
+    print(f"New depth1 shape: {depth1.shape}")
+    print(f"New depth2 shape: {depth2.shape}")
+    return image1, image2, depth1, depth2
+
 
 def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     gripper_pos = demo[keypoint_1].gripper_pose[:3]
@@ -179,7 +180,6 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     robot_seg[robot_seg<30] = 1
     robot_seg[robot_seg!=1] = 0
     mag_sum = np.zeros((obs_1.shape[0], obs_1.shape[1]))
-    # breakpoint()
 
     # Get pseudo-ground truth segmentation
     if keypoint_1 > keypoint_2:
@@ -187,159 +187,82 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     else:
         frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
 
-    max_flow = -1000
+    # Save robot segmentation
+    fstop = frame_range.stop - 1
+    category_name = f"MONEY3D-same-{camera_view}-{frame_range.start}-{fstop}"
+    value = 0
+    robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
+    os.makedirs(robot_save_dir, exist_ok=True) 
+    np.save(os.path.join(robot_save_dir, f'{value:05}.npy'), robot_seg)
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
+            depth_n = demo[idx].front_depth
+            intrinsics = env._scene._cam_front.get_intrinsic_matrix()
         elif camera_view == 'left_shoulder':
             obs_n = demo[idx].left_shoulder_rgb
+            depth_n = demo[idx].left_shoulder_depth
+            intrinsics = env._scene._cam_over_shoulder_left.get_intrinsic_matrix()
         elif camera_view == 'right_shoulder':
             obs_n = demo[idx].right_shoulder_rgb
+            depth_n = demo[idx].right_shoulder_depth
+            intrinsics = env._scene._cam_over_shoulder_right.get_intrinsic_matrix()
         elif camera_view == 'overhead':
             obs_n = demo[idx].overhead_rgb
+            depth_n = demo[idx].overhead_depth
+            intrinsics = env._scene._cam_overhead.get_intrinsic_matrix()
         # Use RAFT to get optical flow
-        optical_flow = get_pred_flow(obs_1, obs_n)
-        print("Saving flow reg")
-        optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
-        max_flow_sing = get_max_flow_singular(optical_flow_reshaped.cpu().numpy())
-        if max_flow_sing > max_flow:
-            max_flow = max_flow_sing
+        fx = intrinsics[0, 0]
+        fy = intrinsics[1, 1]
+        cx = intrinsics[0, 2]
+        cy = intrinsics[1, 2]
 
-    for idx in frame_range:
-        if camera_view == 'front':
-            obs_n = demo[idx].front_rgb
-        elif camera_view == 'left_shoulder':
-            obs_n = demo[idx].left_shoulder_rgb
-        elif camera_view == 'right_shoulder':
-            obs_n = demo[idx].right_shoulder_rgb
-        elif camera_view == 'overhead':
-            obs_n = demo[idx].overhead_rgb
-        # Use RAFT to get optical flow
-        optical_flow = get_pred_flow_sequence_normalized(obs_1, obs_n, max_flow)
-        magnitudes = get_flow_magnitudes(optical_flow.cpu().numpy())
-        # Zero out magnitudes of pixels that are part of the robot
-        mag_no_robot = np.multiply(magnitudes, robot_seg)
-        if mag_no_robot.max() > 0:
-            mag_sum += mag_no_robot/np.max(mag_no_robot)
-        fstop = frame_range.stop - 1
-        category_name = f"WINE3-{camera_view}-{frame_range.start}-{fstop}"
+        depth1 = torch.from_numpy(depth_1).float().to(device).unsqueeze(0)
+        depth2 = torch.from_numpy(depth_n).float().to(device).unsqueeze(0)
+        image1 = torch.from_numpy(obs_1).permute(2,0,1).float().to(device).unsqueeze(0)
+        image2 = torch.from_numpy(obs_n).permute(2,0,1).float().to(device).unsqueeze(0)
+        intrinsics = torch.as_tensor([fx, fy, cx, cy]).float().to(device).unsqueeze(0)
+
+        image1, image2, depth1, depth2 = prepare_images_and_depths(image1, image2, depth1, depth2)
+        print(depth_1.shape)
+        # breakpoint()
+        Ts = raft_model(image1, image2, depth1, depth2, intrinsics)
+    
+        # compute 2d and 3d from from SE3 field (Ts)
+        flow2d, flow3d, _ = pops.induced_flow(Ts, depth1, intrinsics)
+        optical_flow = flow3d / DEPTH_SCALE
+        optical_flow = optical_flow.squeeze(0).detach().cpu().numpy()
+        # breakpoint()
+        # optical_flow = optical_flow.transpose(1,2,0)
 
         # Save RGB image 
         value = idx - frame_range.start
-        rgb_save_dir = os.path.join('tsg', 'JPEGImages', category_name) 
+        rgb_save_dir = os.path.join('tsg', 'jpgs', category_name) 
         os.makedirs(rgb_save_dir, exist_ok=True) 
         plt.imsave(os.path.join(rgb_save_dir, f'{value:05}.jpg'), obs_n) 
         plt.clf()
 
-        # Save Flow image 
-        flow_save_dir = os.path.join('tsg', f'FlowImages_gap1_to_k', category_name) 
+        # Save Flow
+        flow_save_dir = os.path.join('tsg', f'non_normalized_flow', category_name) 
         os.makedirs(flow_save_dir, exist_ok=True) 
         print("Saving flow seq")
-        flo = flow_to_image(optical_flow.cpu().numpy())
-        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.png'), flo / 255.0)
-        plt.clf()
+        np.save(os.path.join(flow_save_dir, f'{value:05}.npy'), optical_flow)
+        # flow_save_dir = os.path.join('tsg', f'non_normalized_flow_imgs', category_name) 
+        # os.makedirs(flow_save_dir, exist_ok=True) 
+        # plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), optical_flow / 255.0) 
+        # plt.clf()
+        gc.collect()
+        torch.cuda.empty_cache()
+        del depth1
+        del depth2
+        del image1
+        del image2
+        del intrinsics
+        del Ts
+        torch.cuda.synchronize()
 
-    mag_save_dir = os.path.join('tsg', f'magnitudes', category_name) 
-    os.makedirs(mag_save_dir, exist_ok=True) 
-    plt.imsave(os.path.join(mag_save_dir, f'{value:05}.png'), mag_sum)
-    plt.clf()
-
-    norm_mag_sum = mag_sum / len(frame_range)
-    mag_norm_save_dir = os.path.join('tsg', f'norm_magnitudes', category_name) 
-    os.makedirs(mag_norm_save_dir, exist_ok=True) 
-    plt.imsave(os.path.join(mag_norm_save_dir, f'{value:05}.png'), norm_mag_sum)
-    plt.clf()
-
-    data = norm_mag_sum.flatten()
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(data, bins=100, edgecolor='black')
-    plt.title('Histogram of Magnitudes')
-    plt.xlabel('Magnitude')
-    plt.ylabel('Frequency (Log Scale)')
-    plt.grid(True)
-
-    hist_save_dir = os.path.join('tsg', f'hist', category_name) 
-    os.makedirs(hist_save_dir, exist_ok=True) 
-    plt.savefig(os.path.join(hist_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    plt.figure(figsize=(8, 6))
-    heatmap = plt.imshow(norm_mag_sum, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar(heatmap)
-    cbar.set_label('Magnitude')
-    ticks = np.linspace(np.min(norm_mag_sum), np.max(norm_mag_sum), num=40)
-    cbar.set_ticks(ticks)
-    cbar.set_ticklabels([f"{tick:.2f}" for tick in ticks])
-    plt.title('Magnitude Heatmap')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    heatmap_save_dir = os.path.join('tsg', f'norm_magnitudes_heat', category_name) 
-    os.makedirs(heatmap_save_dir, exist_ok=True) 
-    plt.savefig(os.path.join(heatmap_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    mean = np.mean(norm_mag_sum)
-    std = np.std(norm_mag_sum)
-    deviation = (norm_mag_sum - mean) / std
-
-    plt.figure(figsize=(8, 6))
-    heatmap2 = plt.imshow(deviation, cmap='coolwarm', interpolation='nearest')
-
-    cbar = plt.colorbar(heatmap2)
-    cbar.set_label('Standard Deviations from Mean')
-    ticks = [-3, -2, -1, 0, 1, 2, 3]
-    cbar.set_ticks(ticks)
-    tick_labels = ['99.7% (-3σ)', '95% (-2σ)', '68% (-1σ)', 'Mean (0σ)', '68% (+1σ)', '95% (+2σ)', '99.7% (+3σ)']
-    cbar.set_ticklabels(tick_labels)
-
-    plt.title('Deviation from Mean')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-
-    heatmap2_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std', category_name)
-    os.makedirs(heatmap2_save_dir, exist_ok=True)
-    plt.savefig(os.path.join(heatmap2_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    mean = np.mean(norm_mag_sum)
-    std = np.std(norm_mag_sum)
-    threshold_low = mean + 3 * std
-    norm_mag_sum_clipped = np.where((norm_mag_sum < threshold_low), 0, norm_mag_sum)
-    heatmap = plt.imshow(norm_mag_sum_clipped, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar(heatmap)
-
-    cbar.set_label('Flow Magnitude (clipped)')
-
-    plt.title('Flow Heatmap with Values Below Mean Zeroed Out')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    clip_std_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std_clipped', category_name)
-    os.makedirs(clip_std_save_dir, exist_ok=True)
-    plt.savefig(os.path.join(clip_std_save_dir, f'{value:05}.png'))
-    plt.clf()
-
-    kernel = np.ones((5, 5), np.uint8)
-    ground_truth_seg_loose = (norm_mag_sum_clipped >= mean).astype(np.uint8)
-    ground_truth_seg_tight = (norm_mag_sum_clipped >= mean).astype(np.uint8)
-    eroded_gt_seg_loose = cv2.erode(ground_truth_seg_loose, kernel, iterations=1)
-    dilated_gt_seg_loose = cv2.dilate(eroded_gt_seg_loose, kernel, iterations=1)
-    eroded_gt_seg_tight = cv2.erode(ground_truth_seg_tight, kernel, iterations=1)
-    dilated_gt_seg_tight = cv2.dilate(eroded_gt_seg_tight, kernel, iterations=1)
-
-    # Ensure all parts of segmentation in workspace with point cloud
-    for i in range(ground_truth_seg_loose.shape[0]):
-        for j in range(ground_truth_seg_loose.shape[1]):
-            if pcd_1[i][j][0] < -0.6 or pcd_1[i][j][0] > 0.6 or pcd_1[i][j][1] < -0.6 or pcd_1[i][j][1] > 0.6 or pcd_1[i][j][2] < 0.7525: #-0.5, 0.52, -0.55, 0.55
-                dilated_gt_seg_loose[i][j] = 0  
-                dilated_gt_seg_tight[i][j] = 0
-    
-    # Find connected component closest to gripper position
-    final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, pcd_1)
-    final_gt_seg_t = connected_components(dilated_gt_seg_tight, gripper_pos, pcd_1)
-
-    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "l")
-    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "t")
+    final_gt_seg_l = 1
+    final_gt_seg_t = 1
 
     return final_gt_seg_l, final_gt_seg_t, obs_1, depth_1, pcd_1, gt_mask
 
@@ -412,20 +335,20 @@ if __name__ == '__main__':
     start_time = datetime.now()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='models/raft-things.pth', help="restore checkpoint")
+    parser.add_argument('--model', default='models/raft3d.pth', help="restore checkpoint")
     parser.add_argument('--small', action='store_true', help='use small model')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
     parser.add_argument('--threshold', default=0.001, help='threshold') # Use 0.05 if want a tighter threhold for flow aggregation (currently collecting both loose and tight pseudo ground truth)
     args = parser.parse_args()
-
+    device = torch.device("cuda:0")
     # Set up RAFT model
-    raft_model = torch.nn.DataParallel(RAFT(args))
-    raft_model.load_state_dict(torch.load(args.model))
-    raft_model = raft_model.module
-    raft_model.to(DEVICE)
+    raft_3D = importlib.import_module('RAFT3D.raft3d.raft3d').RAFT3D
+    raft_model = raft_3D(args)
+    raft_model.load_state_dict(torch.load(args.model), strict=False)
     raft_model.eval()
-
+    raft_model.to(device)
+    # breakpoint()
     # Set up logging
     logging.basicConfig(filename='collect_data_'+str(start_time)+'.log', level=logging.DEBUG)
 
@@ -496,6 +419,7 @@ if __name__ == '__main__':
                     pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask = get_keypoint_pseudo_gt(demo, keypoint, keypoints[keypoint_idx+1])
                 pseudo_gt_masks_loose.append(pseudo_gt_mask_l)
                 pseudo_gt_masks_tight.append(pseudo_gt_mask_t)
+                # breakpoint()
                 rgb_obs.append(rgb)
                 depth_obs.append(depth)
                 pcd_obs.append(pcd)
