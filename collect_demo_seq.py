@@ -14,10 +14,9 @@ import os
 import argparse
 from datetime import datetime
 from raft import RAFT
-from flow_viz import flow_to_image, get_max_flow_singular, flow_to_image_sequential
 from utils import flow_viz
 from utils.utils import InputPadder
-
+from flow_viz import flow_to_image, get_max_flow_singular
 from rlbench.action_modes.action_mode import MoveArmThenGripper
 from rlbench.action_modes.arm_action_modes import JointVelocity
 from rlbench.action_modes.gripper_action_modes import Discrete
@@ -26,6 +25,7 @@ from rlbench.tasks import *
 from rlbench.observation_config import ObservationConfig
 from rlbench.demo import Demo
 from typing import List
+from sklearn.cluster import KMeans
 
 import torchvision as tv
 from torchvision import transforms as T
@@ -49,7 +49,7 @@ def get_pred_flow(obs_1, obs_2):
 
         flow_low, flow_up = raft_model(image1, image2, iters=40, test_mode=True)
         return flow_up
-
+    
 def get_pred_flow_sequence_normalized(obs_1, obs_2, max_flow):
 
     with torch.no_grad():
@@ -125,60 +125,27 @@ def connected_components(dilated_gt_seg, gripper_pos, pcd, max_distance = 0.1):
     return final_gt_seg_1
 
 def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
+    gripper_pos = demo[keypoint_1].gripper_pose[:3]
     if camera_view == 'front':
         obs_1 = demo[keypoint_1].front_rgb
         pcd_1 = demo[keypoint_1].front_point_cloud
         depth_1 = demo[keypoint_1].front_depth
         gt_mask = demo[keypoint_1].front_mask
-        cam_pose = env._scene._cam_front.get_pose()
-        intrinsics = env._scene._cam_front.get_intrinsic_matrix()
     elif camera_view == 'left_shoulder':
         obs_1 = demo[keypoint_1].left_shoulder_rgb
         pcd_1 = demo[keypoint_1].left_shoulder_point_cloud
         depth_1 = demo[keypoint_1].left_shoulder_depth
         gt_mask = demo[keypoint_1].left_shoulder_mask
-        cam_pose = env._scene._cam_over_shoulder_left.get_pose()
-        intrinsics = env._scene._cam_over_shoulder_left.get_intrinsic_matrix()
     elif camera_view == 'right_shoulder':
         obs_1 = demo[keypoint_1].right_shoulder_rgb
         pcd_1 = demo[keypoint_1].right_shoulder_point_cloud
         depth_1 = demo[keypoint_1].right_shoulder_depth
         gt_mask = demo[keypoint_1].right_shoulder_mask
-        cam_pose = env._scene._cam_over_shoulder_right.get_pose()
-        intrinsics = env._scene._cam_over_shoulder_right.get_intrinsic_matrix()
     elif camera_view == 'overhead':
         obs_1 = demo[keypoint_1].overhead_rgb
         pcd_1 = demo[keypoint_1].overhead_point_cloud
         depth_1 = demo[keypoint_1].overhead_depth
         gt_mask = demo[keypoint_1].overhead_mask
-        cam_pose = env._scene._cam_overhead.get_pose()
-        intrinsics = env._scene._cam_overhead.get_intrinsic_matrix()
-
-    
-    from scipy.spatial.transform import Rotation as R
-
-    camera_position = cam_pose[:3]
-    camera_quaternion = cam_pose[3:]
-
-    # Convert quaternion to rotation matrix
-    rotation_matrix = R.from_quat(camera_quaternion).as_matrix()
-
-    # Construct the extrinsic matrix
-    extrinsic_matrix = np.eye(4)
-    extrinsic_matrix[:3, :3] = rotation_matrix
-    extrinsic_matrix[:3, 3] = camera_position
-    gripper_pos = demo[keypoint_1].gripper_pose[:3]
-    gripper_position_homogeneous = np.append(gripper_pos, 1)  # Only position part for simplicity
-
-    # Transform gripper pose to camera frame
-    camera_extrinsics_inv = np.linalg.inv(extrinsic_matrix)
-    gripper_pose_camera_frame = np.dot(camera_extrinsics_inv, gripper_position_homogeneous)
-    gripper_pose_camera_frame = gripper_pose_camera_frame[:3]  # Extract 3D coordinates
-    
-    gripper_pose_2d = np.dot(intrinsics, gripper_pose_camera_frame)
-    gripper_pose_2d /= gripper_pose_2d[2]  # Normalize to get (x, y) coordinates
-
-    # breakpoint()
 
     # Get ground truth robot segmentation for initial grasp
     robot_seg = gt_mask
@@ -192,24 +159,8 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         frame_range = range(keypoint_2, keypoint_1) # Unused in current implementation (if we ever wanted to aggreegate flow in reverse direction)
     else:
         frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
-
-    # Save robot segmentation
-    fstop = frame_range.stop - 1
-    category_name = f"U-inf-same-{camera_view}-{frame_range.start}-{fstop}-{str(datetime.now())}"
-    value = 0
-    robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
-    os.makedirs(robot_save_dir, exist_ok=True) 
-    np.save(os.path.join(robot_save_dir, f'{value:05}.npy'), robot_seg)
-
-    gripper_save_dir = os.path.join('tsg', 'gripper', category_name) 
-    os.makedirs(gripper_save_dir, exist_ok=True) 
-    np.save(os.path.join(gripper_save_dir, f'{value:05}.npy'), gripper_pose_2d)
-    # breakpoint()
-
-    pcl_save_dir = os.path.join('tsg', 'pcl', category_name) 
-    os.makedirs(pcl_save_dir, exist_ok=True) 
-    np.save(os.path.join(pcl_save_dir, f'{value:05}.npy'), pcd_1)
-
+    
+    max_flow = -1000
     for idx in frame_range:
         if camera_view == 'front':
             obs_n = demo[idx].front_rgb
@@ -221,27 +172,187 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
             obs_n = demo[idx].overhead_rgb
         # Use RAFT to get optical flow
         optical_flow = get_pred_flow(obs_1, obs_n)
-        optical_flow = optical_flow.squeeze().permute(1, 2, 0)
+        print("Saving flow reg")
+        optical_flow_reshaped = optical_flow.squeeze().permute(1, 2, 0)
+        max_flow_sing = get_max_flow_singular(optical_flow_reshaped.cpu().numpy())
+        if max_flow_sing > max_flow:
+            max_flow = max_flow_sing
+
+    for idx in frame_range:
+        if camera_view == 'front':
+            obs_n = demo[idx].front_rgb
+        elif camera_view == 'left_shoulder':
+            obs_n = demo[idx].left_shoulder_rgb
+        elif camera_view == 'right_shoulder':
+            obs_n = demo[idx].right_shoulder_rgb
+        elif camera_view == 'overhead':
+            obs_n = demo[idx].overhead_rgb
+        # Use RAFT to get optical flow
+        optical_flow = get_pred_flow_sequence_normalized(obs_1, obs_n, max_flow)
+        magnitudes = get_flow_magnitudes(optical_flow.cpu().numpy())
+        # Zero out magnitudes of pixels that are part of the robot
+        mag_no_robot = np.multiply(magnitudes, robot_seg)
+        if mag_no_robot.max() > 0:
+            mag_sum += mag_no_robot #/np.max(mag_no_robot)
+        fstop = frame_range.stop - 1
+        category_name = f"safe-sequential-{camera_view}-{frame_range.start}-{fstop}"
 
         # Save RGB image 
         value = idx - frame_range.start
-        rgb_save_dir = os.path.join('tsg', 'jpgs', category_name) 
+        rgb_save_dir = os.path.join('tsg', 'JPEGImages', category_name) 
         os.makedirs(rgb_save_dir, exist_ok=True) 
         plt.imsave(os.path.join(rgb_save_dir, f'{value:05}.jpg'), obs_n) 
         plt.clf()
 
-        # Save Flow
-        flow_save_dir = os.path.join('tsg', f'non_normalized_flow', category_name) 
+        # Save Flow image 
+        flow_save_dir = os.path.join('tsg', f'FlowImages_gap1_to_k', category_name) 
         os.makedirs(flow_save_dir, exist_ok=True) 
         print("Saving flow seq")
-        np.save(os.path.join(flow_save_dir, f'{value:05}.npy'), optical_flow.cpu().numpy())
-        flow_save_dir = os.path.join('tsg', f'non_normalized_flow_imgs', category_name) 
-        os.makedirs(flow_save_dir, exist_ok=True) 
-        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), flow_to_image(optical_flow.cpu().numpy())) 
+        flo = flow_to_image(optical_flow.cpu().numpy())
+        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.png'), flo / 255.0)
         plt.clf()
 
-    final_gt_seg_l = 1
-    final_gt_seg_t = 1
+    mag_save_dir = os.path.join('tsg', f'magnitudes', category_name) 
+    os.makedirs(mag_save_dir, exist_ok=True) 
+    plt.imsave(os.path.join(mag_save_dir, f'{value:05}.png'), mag_sum)
+    plt.clf()
+
+    norm_mag_sum = mag_sum / len(frame_range)
+    mag_norm_save_dir = os.path.join('tsg', f'norm_magnitudes', category_name) 
+    os.makedirs(mag_norm_save_dir, exist_ok=True) 
+    plt.imsave(os.path.join(mag_norm_save_dir, f'{value:05}.png'), norm_mag_sum)
+    plt.clf()
+
+    # Flatten the matrix to get a 1D array of magnitudes
+    data = norm_mag_sum.flatten()
+
+    # Create the histogram
+    plt.figure(figsize=(10, 6))
+    plt.hist(data, bins=100, edgecolor='black', log=True)
+    plt.title('Histogram of Magnitudes')
+    plt.xlabel('Magnitude')
+    plt.ylabel('Frequency (Log Scale)')
+    plt.grid(True)
+
+    hist_save_dir = os.path.join('tsg', f'hist', category_name) 
+    os.makedirs(hist_save_dir, exist_ok=True) 
+    plt.savefig(os.path.join(hist_save_dir, f'{value:05}.png'))
+    plt.clf()
+
+    # Generate a heatmap for normalized magnitudes
+    plt.figure(figsize=(8, 6))
+    heatmap = plt.imshow(norm_mag_sum, cmap='viridis', interpolation='nearest')
+    cbar = plt.colorbar(heatmap)
+    cbar.set_label('Magnitude')
+    ticks = np.linspace(np.min(norm_mag_sum), np.max(norm_mag_sum), num=40)
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([f"{tick:.2f}" for tick in ticks])
+    plt.title('Magnitude Heatmap')
+    plt.xlabel('X coordinate')
+    plt.ylabel('Y coordinate')
+    heatmap_save_dir = os.path.join('tsg', f'norm_magnitudes_heat', category_name) 
+    os.makedirs(heatmap_save_dir, exist_ok=True) 
+    plt.savefig(os.path.join(heatmap_save_dir, f'{value:05}.png'))
+    plt.clf()
+
+    # Calculate the mean and standard deviation
+    mean = np.mean(norm_mag_sum)
+    std = np.std(norm_mag_sum)
+
+    # Calculate deviations from the mean in terms of standard deviation
+    deviation = (norm_mag_sum - mean) / std
+
+    # Create the heatmap for deviations
+    plt.figure(figsize=(8, 6))
+    heatmap2 = plt.imshow(deviation, cmap='coolwarm', interpolation='nearest')
+
+    # Create colorbar with specific ticks for the 68-95-99.7 rule
+    cbar = plt.colorbar(heatmap2)
+    cbar.set_label('Standard Deviations from Mean')
+    # Place ticks at the standard deviations corresponding to the empirical rule
+    ticks = [-3, -2, -1, 0, 1, 2, 3]
+    cbar.set_ticks(ticks)
+    # Optionally, you can label these with the percentages they represent
+    tick_labels = ['99.7% (-3σ)', '95% (-2σ)', '68% (-1σ)', 'Mean (0σ)', '68% (+1σ)', '95% (+2σ)', '99.7% (+3σ)']
+    cbar.set_ticklabels(tick_labels)
+
+    plt.title('Deviation from Mean')
+    plt.xlabel('X coordinate')
+    plt.ylabel('Y coordinate')
+
+    # Save the heatmap
+    heatmap2_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std', category_name)
+    os.makedirs(heatmap2_save_dir, exist_ok=True)
+    plt.savefig(os.path.join(heatmap2_save_dir, f'{value:05}.png'))
+    plt.clf()
+
+    # Assuming 'flow' is your flow data array
+    mean = np.mean(norm_mag_sum)
+    std = np.std(norm_mag_sum)
+    threshold_low = mean + 4 * std
+    norm_mag_sum_clipped = np.where((norm_mag_sum < threshold_low), 0, norm_mag_sum)
+    heatmap = plt.imshow(norm_mag_sum_clipped, cmap='viridis', interpolation='nearest')
+    cbar = plt.colorbar(heatmap)
+
+    cbar.set_label('Flow Magnitude (clipped)')
+
+    plt.title('Flow Heatmap with Values Below Mean Zeroed Out')
+    plt.xlabel('X coordinate')
+    plt.ylabel('Y coordinate')
+    clip_std_save_dir = os.path.join('tsg', f'norm_magnitudes_heat_std_clipped', category_name)
+    os.makedirs(clip_std_save_dir, exist_ok=True)
+    plt.savefig(os.path.join(clip_std_save_dir, f'{value:05}.png'))
+    plt.clf()
+
+    # Assuming norm_mag_sum is your matrix from which gradients are computed
+    grad_y, grad_x = np.gradient(norm_mag_sum)
+
+    # Create a meshgrid for plotting
+    x = np.arange(0, norm_mag_sum.shape[1], 1)  # Considering every column
+    y = np.arange(0, norm_mag_sum.shape[0], 1)  # Considering every row
+    X, Y = np.meshgrid(x, y)
+
+    # Plot the vector field
+    plt.figure(figsize=(10, 10))
+    # The 'scale' parameter controls the scaling of arrows; adjust as necessary to make arrows larger or smaller
+    # The 'width' parameter controls the thickness of arrows
+    quiver = plt.quiver(X, Y, grad_x, grad_y, scale=50, width=0.05, color='r')
+
+    plt.title('2D Vector Field of Gradient Magnitudes')
+    plt.xlabel('X coordinate')
+    plt.ylabel('Y coordinate')
+    plt.grid(True)
+    plt.axis('equal')  # Ensures that one unit in x is the same as one unit in y
+    plt.colorbar(quiver, label='Gradient Magnitude')
+
+    gradient_dir = os.path.join('tsg', f'gradient_field', category_name)
+    os.makedirs(gradient_dir, exist_ok=True)
+    plt.savefig(os.path.join(gradient_dir, f'{value:05}.png'))
+    plt.clf()
+
+    kernel = np.ones((5, 5), np.uint8)
+    ground_truth_seg_loose = (norm_mag_sum >= 0.001).astype(np.uint8)
+    ground_truth_seg_tight = (norm_mag_sum >= 0.05).astype(np.uint8)
+    eroded_gt_seg_loose = cv2.erode(ground_truth_seg_loose, kernel, iterations=1)
+    dilated_gt_seg_loose = cv2.dilate(eroded_gt_seg_loose, kernel, iterations=1)
+    eroded_gt_seg_tight = cv2.erode(ground_truth_seg_tight, kernel, iterations=1)
+    dilated_gt_seg_tight = cv2.dilate(eroded_gt_seg_tight, kernel, iterations=1)
+
+    # Ensure all parts of segmentation in workspace with point cloud
+    for i in range(ground_truth_seg_loose.shape[0]):
+        for j in range(ground_truth_seg_loose.shape[1]):
+            if pcd_1[i][j][0] < -0.6 or pcd_1[i][j][0] > 0.6 or pcd_1[i][j][1] < -0.6 or pcd_1[i][j][1] > 0.6 or pcd_1[i][j][2] < 0.7525: #-0.5, 0.52, -0.55, 0.55
+                dilated_gt_seg_loose[i][j] = 0  
+                dilated_gt_seg_tight[i][j] = 0
+    
+    # Find connected component closest to gripper position
+    final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, pcd_1)
+    final_gt_seg_t = connected_components(dilated_gt_seg_tight, gripper_pos, pcd_1)
+
+    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "l")
+    plot_segmentations(obs_1, final_gt_seg_l, category_name, value, "t")
+
+    print("DONE")
 
     return final_gt_seg_l, final_gt_seg_t, obs_1, depth_1, pcd_1, gt_mask
 
@@ -303,13 +414,7 @@ if __name__ == '__main__':
         if hasattr(obj, '__class__') and obj.__class__.__name__ == 'type':
             TASKS.append(obj)
     DEVICE = 'cuda'
-    START_RANGE = 0
-    END_RANGE = 27
-    # Intervals for all RLBench Tasks (0,27) (27,54) (54,80) (80,106)s
     breakpoint()
-    # TASKS = [PhoneOnBase, StackWine, InsertOntoSquarePeg, PlaceShapeInShapeSorter, CloseBox, PlaceCups, SweepToDustpan, OpenDoor, HitBallWithQueue, ScoopWithSpatula, InsertUsbInComputer]
-    print(TASKS)
-    SAMPLES = 1
 
     start_time = datetime.now()
 
@@ -342,10 +447,10 @@ if __name__ == '__main__':
         headless=True)
     env.launch()
 
-        # Loop through each task in the range
+    # Loop through each task in the range
     for idx, t in enumerate(TASKS):
-        print("Starting",idx+START_RANGE)
-        logging.info("Starting "+str(idx+START_RANGE))
+        print("Starting",idx)
+        logging.info("Starting "+str(idx))
         task = env.get_task(t)
         task_name = task.get_name()
         samples_done = 0
@@ -353,74 +458,54 @@ if __name__ == '__main__':
         keyframe_errors = 0
         if not os.path.exists('./training-dataset/'+"rlbench-alltasks-15"):
             os.makedirs('./training-dataset/'+"rlbench-alltasks-15")
-            
-        # For each task sample a number of demos
-        while samples_done < SAMPLES:
-            task.sample_variation()
-            descriptions, obs = task.reset()
-            # Get demonstration
-            try:
-                demo = task.get_demos(1, live_demos=live_demos)  # -> List[List[Observation]]
-            except:
-                print("Error getting demo for", task_name, "sample", samples_done+1)
-                logging.error("Error getting demo for "+task_name+" sample "+str(samples_done+1))
-                demo_errors += 1
-                if demo_errors > 3:
-                    break
-                else:
-                    continue
-            demo = np.array(demo, dtype=object).flatten()
+        
+        task.sample_variation()
+        descriptions, obs = task.reset()
+        # Get demonstration
+        try:
+            demo = task.get_demos(1, live_demos=live_demos)  # -> List[List[Observation]]
+        except:
+            print("Error getting demo for", task_name, "sample", samples_done+1)
+            logging.error("Error getting demo for "+task_name+" sample "+str(samples_done+1))
+            demo_errors += 1
+            if demo_errors > 3:
+                break
+            else:
+                continue
+        demo = np.array(demo, dtype=object).flatten()
 
-            # Get keypoints
-            keypoints = keypoint_discovery(demo)
-            if len(keypoints) < 1:
-                print("Error with number of keyframes for", task_name, "sample", samples_done+1)
-                logging.error("Error with number of keyframes for "+task_name+" sample "+str(samples_done+1))
-                keyframe_errors += 1
-                if keyframe_errors > 3:
-                    break
-                else:
-                    continue  
+        # Get keypoints
+        keypoints = keypoint_discovery(demo)
+        if len(keypoints) < 1:
+            print("Error with number of keyframes for", task_name, "sample", samples_done+1)
+            logging.error("Error with number of keyframes for "+task_name+" sample "+str(samples_done+1))
+            keyframe_errors += 1
+            if keyframe_errors > 3:
+                break
+            else:
+                continue  
 
-            # Initialize lists to store data          
-            pseudo_gt_masks_loose = []
-            pseudo_gt_masks_tight = []
-            rgb_obs = []
-            depth_obs = []
-            pcd_obs = []
-            gt_masks = []
+        # Initialize lists to store data          
+        pseudo_gt_masks_loose = []
+        pseudo_gt_masks_tight = []
+        rgb_obs = []
+        depth_obs = []
+        pcd_obs = []
+        gt_masks = []
 
-            # For each keypoint, get pseudo ground truth
-            for keypoint_idx, keypoint in enumerate(keypoints):
-                if keypoint_idx == len(keypoints)-1:
-                    pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask = get_keypoint_pseudo_gt(demo, keypoint, len(demo)-1)
-                else:
-                    pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask = get_keypoint_pseudo_gt(demo, keypoint, keypoints[keypoint_idx+1])
-                pseudo_gt_masks_loose.append(pseudo_gt_mask_l)
-                pseudo_gt_masks_tight.append(pseudo_gt_mask_t)
-                rgb_obs.append(rgb)
-                depth_obs.append(depth)
-                pcd_obs.append(pcd)
-                gt_masks.append(gt_mask)
-                
-            # # Save the data
-            # np.savez('./training-dataset/'+"rlbench-alltasks-15/"+task_name+"-"+str(samples_done)+"-action_object.npz", 
-            #         first_rgb = demo[0].front_rgb, 
-            #         final_rgb = demo[-1].front_rgb, 
-            #         rgb = rgb_obs,
-            #         desc= descriptions, 
-            #         depth = depth_obs, 
-            #         pcd = pcd_obs,
-            #         gt_mask = gt_masks,
-            #         pseudo_gt_loose = pseudo_gt_masks_loose,
-            #         pseudo_gt_tight = pseudo_gt_masks_tight
-            #         ) 
-            samples_done += 1    
-            print("Samples left to do:",SAMPLES-samples_done, "for", task_name)
-            logging.info("Samples left to do: "+str(SAMPLES-samples_done)+ " for "+task_name)
-        if samples_done < SAMPLES:
-            print("Problem with", task_name)
-            logging.warning("Problem with "+task_name)
+        # For each keypoint, get pseudo ground truth
+        for keypoint_idx, keypoint in enumerate(keypoints):
+            if keypoint_idx == len(keypoints)-1:
+                pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask = get_keypoint_pseudo_gt(demo, keypoint, len(demo)-1)
+            else:
+                pseudo_gt_mask_l, pseudo_gt_mask_t, rgb, depth, pcd, gt_mask = get_keypoint_pseudo_gt(demo, keypoint, keypoints[keypoint_idx+1])
+            pseudo_gt_masks_loose.append(pseudo_gt_mask_l)
+            pseudo_gt_masks_tight.append(pseudo_gt_mask_t)
+            rgb_obs.append(rgb)
+            depth_obs.append(depth)
+            pcd_obs.append(pcd)
+            gt_masks.append(gt_mask)
+
     print("Done")
     logging.info("Done")
     end_time = datetime.now()

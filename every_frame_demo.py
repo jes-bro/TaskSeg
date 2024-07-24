@@ -1,6 +1,6 @@
 import numpy as np
 import open3d as o3d
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation as R
 import cv2
 import matplotlib.pyplot as plt
 import copy
@@ -125,120 +125,146 @@ def connected_components(dilated_gt_seg, gripper_pos, pcd, max_distance = 0.1):
     return final_gt_seg_1
 
 def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
-    if camera_view == 'front':
-        obs_1 = demo[keypoint_1].front_rgb
-        pcd_1 = demo[keypoint_1].front_point_cloud
-        depth_1 = demo[keypoint_1].front_depth
-        gt_mask = demo[keypoint_1].front_mask
-        cam_pose = env._scene._cam_front.get_pose()
-        intrinsics = env._scene._cam_front.get_intrinsic_matrix()
-    elif camera_view == 'left_shoulder':
-        obs_1 = demo[keypoint_1].left_shoulder_rgb
-        pcd_1 = demo[keypoint_1].left_shoulder_point_cloud
-        depth_1 = demo[keypoint_1].left_shoulder_depth
-        gt_mask = demo[keypoint_1].left_shoulder_mask
-        cam_pose = env._scene._cam_over_shoulder_left.get_pose()
-        intrinsics = env._scene._cam_over_shoulder_left.get_intrinsic_matrix()
-    elif camera_view == 'right_shoulder':
-        obs_1 = demo[keypoint_1].right_shoulder_rgb
-        pcd_1 = demo[keypoint_1].right_shoulder_point_cloud
-        depth_1 = demo[keypoint_1].right_shoulder_depth
-        gt_mask = demo[keypoint_1].right_shoulder_mask
-        cam_pose = env._scene._cam_over_shoulder_right.get_pose()
-        intrinsics = env._scene._cam_over_shoulder_right.get_intrinsic_matrix()
-    elif camera_view == 'overhead':
-        obs_1 = demo[keypoint_1].overhead_rgb
-        pcd_1 = demo[keypoint_1].overhead_point_cloud
-        depth_1 = demo[keypoint_1].overhead_depth
-        gt_mask = demo[keypoint_1].overhead_mask
-        cam_pose = env._scene._cam_overhead.get_pose()
-        intrinsics = env._scene._cam_overhead.get_intrinsic_matrix()
 
-    
-    from scipy.spatial.transform import Rotation as R
-
-    camera_position = cam_pose[:3]
-    camera_quaternion = cam_pose[3:]
-
-    # Convert quaternion to rotation matrix
-    rotation_matrix = R.from_quat(camera_quaternion).as_matrix()
-
-    # Construct the extrinsic matrix
-    extrinsic_matrix = np.eye(4)
-    extrinsic_matrix[:3, :3] = rotation_matrix
-    extrinsic_matrix[:3, 3] = camera_position
-    gripper_pos = demo[keypoint_1].gripper_pose[:3]
-    gripper_position_homogeneous = np.append(gripper_pos, 1)  # Only position part for simplicity
-
-    # Transform gripper pose to camera frame
-    camera_extrinsics_inv = np.linalg.inv(extrinsic_matrix)
-    gripper_pose_camera_frame = np.dot(camera_extrinsics_inv, gripper_position_homogeneous)
-    gripper_pose_camera_frame = gripper_pose_camera_frame[:3]  # Extract 3D coordinates
-    
-    gripper_pose_2d = np.dot(intrinsics, gripper_pose_camera_frame)
-    gripper_pose_2d /= gripper_pose_2d[2]  # Normalize to get (x, y) coordinates
-
-    # breakpoint()
-
-    # Get ground truth robot segmentation for initial grasp
-    robot_seg = gt_mask
-    robot_seg[robot_seg>=48] = 1
-    robot_seg[robot_seg<30] = 1
-    robot_seg[robot_seg!=1] = 0
-    mag_sum = np.zeros((obs_1.shape[0], obs_1.shape[1]))
+    window = 10
 
     # Get pseudo-ground truth segmentation
     if keypoint_1 > keypoint_2:
-        frame_range = range(keypoint_2, keypoint_1) # Unused in current implementation (if we ever wanted to aggreegate flow in reverse direction)
+        frame_range_outer = range(keypoint_2, keypoint_1) # Unused in current implementation (if we ever wanted to aggreegate flow in reverse direction)
     else:
-        frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
+        frame_range_outer = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
 
-    # Save robot segmentation
-    fstop = frame_range.stop - 1
-    category_name = f"U-inf-same-{camera_view}-{frame_range.start}-{fstop}-{str(datetime.now())}"
-    value = 0
-    robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
-    os.makedirs(robot_save_dir, exist_ok=True) 
-    np.save(os.path.join(robot_save_dir, f'{value:05}.npy'), robot_seg)
+    
+    # Initialize the matrix to track processed pairs
+    N = len(frame_range_outer)
+    processed_matrix = np.zeros((N, N), dtype=bool)
 
-    gripper_save_dir = os.path.join('tsg', 'gripper', category_name) 
-    os.makedirs(gripper_save_dir, exist_ok=True) 
-    np.save(os.path.join(gripper_save_dir, f'{value:05}.npy'), gripper_pose_2d)
-    # breakpoint()
+    # Iterate over the frame indices
+    for frame_idx in range(N):
+        if frame_idx - window < 0:
+            # If negative window is out of bounds, use only positive window
+            start_idx = 0
+            end_idx = frame_idx + window
+        elif frame_idx + window >= N:
+            # If positive window is out of bounds, use only negative window
+            start_idx = frame_idx - window
+            end_idx = N
+        else:
+            # If both windows are valid, use the full range
+            start_idx = frame_idx - window
+            end_idx = frame_idx + window
 
-    pcl_save_dir = os.path.join('tsg', 'pcl', category_name) 
-    os.makedirs(pcl_save_dir, exist_ok=True) 
-    np.save(os.path.join(pcl_save_dir, f'{value:05}.npy'), pcd_1)
+        frame_range = range(frame_range_outer[start_idx], frame_range_outer[end_idx] + 1)
+        print(f"Frame index: {frame_idx}, Frame range: {list(frame_range)}")
 
-    for idx in frame_range:
-        if camera_view == 'front':
-            obs_n = demo[idx].front_rgb
-        elif camera_view == 'left_shoulder':
-            obs_n = demo[idx].left_shoulder_rgb
-        elif camera_view == 'right_shoulder':
-            obs_n = demo[idx].right_shoulder_rgb
-        elif camera_view == 'overhead':
-            obs_n = demo[idx].overhead_rgb
-        # Use RAFT to get optical flow
-        optical_flow = get_pred_flow(obs_1, obs_n)
-        optical_flow = optical_flow.squeeze().permute(1, 2, 0)
+        # Iterate through the window range
+        for j in range(start_idx, end_idx + 1):
+            if frame_idx != j and not processed_matrix[frame_idx][j] and not processed_matrix[j][frame_idx]:
+                print(f"Frame index: {frame_idx}, Frame range: {j}")
+                if camera_view == 'front':
+                    obs_1 = demo[keypoint_1].front_rgb
+                    pcd_1 = demo[keypoint_1].front_point_cloud
+                    depth_1 = demo[keypoint_1].front_depth
+                    gt_mask = demo[keypoint_1].front_mask
+                    cam_pose = env._scene._cam_front.get_pose()
+                    intrinsics = env._scene._cam_front.get_intrinsic_matrix()
+                elif camera_view == 'left_shoulder':
+                    obs_1 = demo[keypoint_1].left_shoulder_rgb
+                    pcd_1 = demo[keypoint_1].left_shoulder_point_cloud
+                    depth_1 = demo[keypoint_1].left_shoulder_depth
+                    gt_mask = demo[keypoint_1].left_shoulder_mask
+                    cam_pose = env._scene._cam_over_shoulder_left.get_pose()
+                    intrinsics = env._scene._cam_over_shoulder_left.get_intrinsic_matrix()
+                elif camera_view == 'right_shoulder':
+                    obs_1 = demo[keypoint_1].right_shoulder_rgb
+                    pcd_1 = demo[keypoint_1].right_shoulder_point_cloud
+                    depth_1 = demo[keypoint_1].right_shoulder_depth
+                    gt_mask = demo[keypoint_1].right_shoulder_mask
+                    cam_pose = env._scene._cam_over_shoulder_right.get_pose()
+                    intrinsics = env._scene._cam_over_shoulder_right.get_intrinsic_matrix()
+                elif camera_view == 'overhead':
+                    obs_1 = demo[keypoint_1].overhead_rgb
+                    pcd_1 = demo[keypoint_1].overhead_point_cloud
+                    depth_1 = demo[keypoint_1].overhead_depth
+                    gt_mask = demo[keypoint_1].overhead_mask
+                    cam_pose = env._scene._cam_overhead.get_pose()
+                    intrinsics = env._scene._cam_overhead.get_intrinsic_matrix()
 
-        # Save RGB image 
-        value = idx - frame_range.start
-        rgb_save_dir = os.path.join('tsg', 'jpgs', category_name) 
-        os.makedirs(rgb_save_dir, exist_ok=True) 
-        plt.imsave(os.path.join(rgb_save_dir, f'{value:05}.jpg'), obs_n) 
-        plt.clf()
+                camera_position = cam_pose[:3]
+                camera_quaternion = cam_pose[3:]
 
-        # Save Flow
-        flow_save_dir = os.path.join('tsg', f'non_normalized_flow', category_name) 
-        os.makedirs(flow_save_dir, exist_ok=True) 
-        print("Saving flow seq")
-        np.save(os.path.join(flow_save_dir, f'{value:05}.npy'), optical_flow.cpu().numpy())
-        flow_save_dir = os.path.join('tsg', f'non_normalized_flow_imgs', category_name) 
-        os.makedirs(flow_save_dir, exist_ok=True) 
-        plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), flow_to_image(optical_flow.cpu().numpy())) 
-        plt.clf()
+                # Convert quaternion to rotation matrix
+                rotation_matrix = R.from_quat(camera_quaternion).as_matrix()
+
+                # Construct the extrinsic matrix
+                extrinsic_matrix = np.eye(4)
+                extrinsic_matrix[:3, :3] = rotation_matrix
+                extrinsic_matrix[:3, 3] = camera_position
+                gripper_pos = demo[keypoint_1].gripper_pose[:3]
+                gripper_position_homogeneous = np.append(gripper_pos, 1)  # Only position part for simplicity
+
+                # Transform gripper pose to camera frame
+                camera_extrinsics_inv = np.linalg.inv(extrinsic_matrix)
+                gripper_pose_camera_frame = np.dot(camera_extrinsics_inv, gripper_position_homogeneous)
+                gripper_pose_camera_frame = gripper_pose_camera_frame[:3]  # Extract 3D coordinates
+                
+                gripper_pose_2d = np.dot(intrinsics, gripper_pose_camera_frame)
+                gripper_pose_2d /= gripper_pose_2d[2]  # Normalize to get (x, y) coordinates
+
+                # breakpoint()
+
+                # Get ground truth robot segmentation for initial grasp
+                robot_seg = gt_mask
+                robot_seg[robot_seg>=48] = 1
+                robot_seg[robot_seg<30] = 1
+                robot_seg[robot_seg!=1] = 0
+
+                # Save robot segmentation
+                # fstop = frame_range.stop - 1
+                category_name = f"BROOM-same-{camera_view}-{frame_idx}-{j}-{str(datetime.now())}"
+                value = 0
+                robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
+                os.makedirs(robot_save_dir, exist_ok=True) 
+                np.save(os.path.join(robot_save_dir, f'{value:05}.npy'), robot_seg)
+
+                gripper_save_dir = os.path.join('tsg', 'gripper', category_name) 
+                os.makedirs(gripper_save_dir, exist_ok=True) 
+                np.save(os.path.join(gripper_save_dir, f'{value:05}.npy'), gripper_pose_2d)
+                # breakpoint()
+
+                pcl_save_dir = os.path.join('tsg', 'pcl', category_name) 
+                os.makedirs(pcl_save_dir, exist_ok=True) 
+                np.save(os.path.join(pcl_save_dir, f'{value:05}.npy'), pcd_1)
+
+                for idx in frame_range:
+                    if camera_view == 'front':
+                        obs_n = demo[idx].front_rgb
+                    elif camera_view == 'left_shoulder':
+                        obs_n = demo[idx].left_shoulder_rgb
+                    elif camera_view == 'right_shoulder':
+                        obs_n = demo[idx].right_shoulder_rgb
+                    elif camera_view == 'overhead':
+                        obs_n = demo[idx].overhead_rgb
+                    # Use RAFT to get optical flow
+                    optical_flow = get_pred_flow(obs_1, obs_n)
+                    optical_flow = optical_flow.squeeze().permute(1, 2, 0)
+
+                    # Save RGB image 
+                    value = idx - frame_range.start
+                    rgb_save_dir = os.path.join('tsg', 'jpgs', category_name) 
+                    os.makedirs(rgb_save_dir, exist_ok=True) 
+                    plt.imsave(os.path.join(rgb_save_dir, f'{value:05}.jpg'), obs_n) 
+                    plt.clf()
+
+                    # Save Flow
+                    flow_save_dir = os.path.join('tsg', f'non_normalized_flow', category_name) 
+                    os.makedirs(flow_save_dir, exist_ok=True) 
+                    print("Saving flow seq")
+                    np.save(os.path.join(flow_save_dir, f'{value:05}.npy'), optical_flow.cpu().numpy())
+                    flow_save_dir = os.path.join('tsg', f'non_normalized_flow_imgs', category_name) 
+                    os.makedirs(flow_save_dir, exist_ok=True) 
+                    plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), flow_to_image(optical_flow.cpu().numpy())) 
+                    plt.clf()
 
     final_gt_seg_l = 1
     final_gt_seg_t = 1
@@ -309,7 +335,7 @@ if __name__ == '__main__':
     breakpoint()
     # TASKS = [PhoneOnBase, StackWine, InsertOntoSquarePeg, PlaceShapeInShapeSorter, CloseBox, PlaceCups, SweepToDustpan, OpenDoor, HitBallWithQueue, ScoopWithSpatula, InsertUsbInComputer]
     print(TASKS)
-    SAMPLES = 1
+    SAMPLES = 10
 
     start_time = datetime.now()
 
