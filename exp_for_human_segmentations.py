@@ -6,6 +6,7 @@ import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import re
 # breakpoint()
 from load_flows import load_rgb_and_flow_from_directory
 from flow_viz import flow_to_image
@@ -96,17 +97,19 @@ def calculate_centroid(binary_mask):
 
     return (cX, cY)
 
+from PIL import Image
 
-def connected_components(dilated_gt_seg, hand_seg, category_name, max_distance = 200):
+def connected_components(dilated_gt_seg, hand_seg, category_name, max_distance = 100):
     # Use connected components to get closest segments to gripper
     num_labels, labels, _, centroids = cv2.connectedComponentsWithStats(dilated_gt_seg)
     label_dir = os.path.join('tsg', f'labels', category_name) 
     os.makedirs(label_dir, exist_ok=True) 
     plt.imshow(labels)
     # plt.plot(hand_center_x,hand_center_y,'ro',markersize=16)
-    breakpoint()
-    hand_center_x, hand_center_y = calculate_centroid(hand_seg)
-    # plt.plot(hand_center_x,hand_center_y,'ro',markersize=16)
+    # breakpoint()
+    hand_center_x = hand_seg[0]
+    hand_center_y = hand_seg[1]
+    plt.plot(hand_center_x,hand_center_y,'ro',markersize=16)
     plt.savefig(os.path.join(label_dir, f'{category_name}.png'))
 
     filtered_labels = np.zeros_like(labels, dtype=np.uint8)
@@ -126,25 +129,52 @@ def connected_components(dilated_gt_seg, hand_seg, category_name, max_distance =
     # Iterate through each selected segment and include its pixels in the combined mask
     return filtered_labels
 
+def resize_binary_mask(mask: np.ndarray, scale_factor: float = .25) -> np.ndarray:
+    # Calculate new dimensions
+    # Resize using nearest neighbor interpolation
+    resized_mask = cv2.resize(mask, (960, 544), interpolation=cv2.INTER_NEAREST)
+    
+    return resized_mask
+
 # Exp 5 Sequence level norm followed by frame level norm, sequence level outlier removal
 base_directory = '/home/jess/TaskSeg/tsg/jpgs'
 
-# Use glob to find all directories that start with "12"
-pattern = os.path.join(base_directory, 'JessConditioner2*')
 
-# Iterate over each matching directory
+# Use glob to find all directories that start with "TEA"
+pattern = os.path.join(base_directory, 'TEEE*')
+
+# Get all directories matching the pattern
+directories = glob.glob(pattern)
+
+# Define a function to extract the number from the directory name
+def extract_number(dir_name):
+    match = re.search(r'TEEE(\d+)', dir_name)
+    return int(match.group(1)) if match else float('inf')
+
+# Sort directories by the extracted number
+sorted_directories = sorted(directories, key=extract_number)
+
+# Iterate over each sorted directory
 val = 0
-for dir_path in glob.glob(pattern):
+for dir_path in sorted_directories:
     if os.path.isdir(dir_path):
         category_name = os.path.basename(dir_path)
-        hand_seg = np.load('/home/jess/Downloads/H.npy')
+        match = re.search(r'\d+', dir_path)
+
+        if match:
+            number = match.group()
+        hand_seg = np.load(f'/home/jess/tea/{number}/index_location.npy')
+        hand_seg[0] = hand_seg[0] // 4
+        hand_seg[1] = hand_seg[1] // 4
+        # breakpoint()
         inv_hand_seg = np.invert(hand_seg)
-        robot_seg = np.load('/home/jess/Downloads/person.npy')
+        robot_seg = resize_binary_mask(np.load(f'/home/jess/tea/{number}/human_location.npy').astype(np.uint8) * 255)
         robot_seg = np.invert(robot_seg)
-        breakpoint()
+        # breakpoint()
         rgb_images, flow_data = load_rgb_and_flow_from_directory(category_name)
         # breakpoint()
         parts = dir_path.split('-')
+        # breakpoint()
         print(f'parts: {parts}')
         start_frame = int(parts[2])
         end_frame = float(parts[3])
@@ -170,7 +200,6 @@ for dir_path in glob.glob(pattern):
             plt.imsave(os.path.join(fl_save_dir, f'{category_name}-{value}.png'), flow_to_image(optical_flow) / 255.0)
             magnitudes = get_flow_magnitudes(optical_flow)
             mag_no_robot = np.multiply(magnitudes, robot_seg)
-            mag_no_robot = np.multiply(mag_no_robot, inv_hand_seg)
             if mag_no_robot.max() > 0:
                 curr_mag = mag_no_robot/np.max(mag_no_robot)
                 framemag_save_dir = os.path.join('tsg', f'seq_and_frame_norm_mag', category_name) 
@@ -196,8 +225,8 @@ for dir_path in glob.glob(pattern):
         std = np.std(data)
 
         kernel = np.ones((5, 5), np.uint8)
-        ground_truth_seg_loose = (norm_mag_sum >= mean + 1.4 * std).astype(np.uint8)
-        breakpoint()
+        ground_truth_seg_loose = (norm_mag_sum >= mean + std).astype(np.uint8)
+        # breakpoint()
         eroded_gt_seg_loose = cv2.erode(ground_truth_seg_loose, kernel, iterations=1)
         dilated_gt_seg_loose = cv2.dilate(eroded_gt_seg_loose, kernel, iterations=1)
 
@@ -212,31 +241,31 @@ for dir_path in glob.glob(pattern):
         final_gt_seg_l = connected_components(dilated_gt_seg_loose, hand_seg, category_name)
 
         non_zero_coords = np.nonzero(final_gt_seg_l)
-
-        # Bounding box coordinates
-        y_min, x_min = np.min(non_zero_coords[0]), np.min(non_zero_coords[1])
-        y_max, x_max = np.max(non_zero_coords[0]), np.max(non_zero_coords[1])
-        # Width and height of the bounding box
-        width = x_max - x_min + 1
-        height = y_max - y_min + 1
-        plt.imshow(rgb_images[0])
-        plt.imshow(final_gt_seg_l, alpha=0.5)
-        # breakpoint()
-        plt.grid(False)
-        plt.axis('off')
-        # plt.plot([x_min, x_min], [y_min, y_max], color='red')
-        # plt.plot([x_max, x_max], [y_min, y_max], color='red')
-        # plt.plot([x_min, x_max], [y_min, y_min], color='red')
-        # plt.plot([x_min, x_max], [y_max, y_max], color='red')
-        # plt.plot(x_center, y_center, 'r*', markersize=16)
-        print(f'x: {x_center}, y: {y_center}')
-        os.makedirs(f'/home/jess/TaskSeg/final_masks-5/segs/jess', exist_ok=True) 
-        os.makedirs(f'/home/jess/TaskSeg/final_masks-5/images/jess', exist_ok=True) 
-        os.makedirs(f'/home/jess/TaskSeg/final_masks-5/gt_bboxs/jess', exist_ok=True) 
-        os.makedirs(f'/home/jess/TaskSeg/final_masks-5/jess', exist_ok=True) 
-        np.save(f'/home/jess/TaskSeg/final_masks-5/gt_bboxs/jess/{val}.npy', np.array([x_min, y_min, x_max, y_max]))
-        np.save(f'/home/jess/TaskSeg/final_masks-5/segs/jess/{val}.npy', final_gt_seg_l)
-        plt.savefig(f'/home/jess/TaskSeg/final_masks-5/jess/{val}.png')
-        plt.clf()
-        plt.imsave(f'/home/jess/TaskSeg/final_masks-5/images/jess/{val}.png', rgb_images[0])
+        if non_zero_coords is not None:
+            # Bounding box coordinates
+            y_min, x_min = np.min(non_zero_coords[0]), np.min(non_zero_coords[1])
+            y_max, x_max = np.max(non_zero_coords[0]), np.max(non_zero_coords[1])
+            # Width and height of the bounding box
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            plt.imshow(rgb_images[0])
+            plt.imshow(final_gt_seg_l, alpha=0.5)
+            # breakpoint()
+            plt.grid(False)
+            plt.axis('off')
+            # plt.plot([x_min, x_min], [y_min, y_max], color='red')
+            # plt.plot([x_max, x_max], [y_min, y_max], color='red')
+            # plt.plot([x_min, x_max], [y_min, y_min], color='red')
+            # plt.plot([x_min, x_max], [y_max, y_max], color='red')
+            # plt.plot(x_center, y_center, 'r*', markersize=16)
+            print(f'x: {x_center}, y: {y_center}')
+            os.makedirs(f'/home/jess/TaskSeg/final_masks-5/segs/tea', exist_ok=True) 
+            os.makedirs(f'/home/jess/TaskSeg/final_masks-5/images/tea', exist_ok=True) 
+            os.makedirs(f'/home/jess/TaskSeg/final_masks-5/gt_bboxs/tea', exist_ok=True) 
+            os.makedirs(f'/home/jess/TaskSeg/final_masks-5/tea', exist_ok=True) 
+            np.save(f'/home/jess/TaskSeg/final_masks-5/gt_bboxs/tea/{val}.npy', np.array([x_min, y_min, x_max, y_max]))
+            np.save(f'/home/jess/TaskSeg/final_masks-5/segs/tea/{val}.npy', final_gt_seg_l)
+            plt.savefig(f'/home/jess/TaskSeg/final_masks-5/tea/{val}.png')
+            plt.clf()
+            plt.imsave(f'/home/jess/TaskSeg/final_masks-5/images/tea/{val}.png', rgb_images[0])
         val+=1
