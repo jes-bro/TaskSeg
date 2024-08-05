@@ -11,6 +11,7 @@ import sys
 sys.path.append('core')
 import logging
 import glob
+import re
 import os
 import argparse
 from datetime import datetime
@@ -79,23 +80,24 @@ def get_pred_flow(obs_1, obs_2, raft_model):
 def keypoint_discovery(demo) -> List[int]:
     demo_len = len(demo)
     keyframes = []
-    for i in range(0, demo_len, 200):
+    for i in range(0, demo_len, 60):
+        # if demo_len - i > 10
         keyframes.append(i)
     return keyframes
 
-def generate_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model):
+def generate_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model, vid_val):
 
     frame_range = range(keypoint_1+1, keypoint_2+1) # Start prediction from subsequent frame to next keyframe
 
     # Save robot segmentation
     fstop = frame_range.stop - 1
-    category_name = f"JessConditioner2-same-{frame_range.start}-{fstop}-{str(datetime.now())}"
+    category_name = f"TEEE{vid_val}-same-{frame_range.start}-{fstop}"
     for idx in frame_range:
         frame_n = demo[idx]
         # breakpoint()
         frame_n = frame_n.reshape(demo[0].shape[0],demo[0].shape[1], 3)
         # Use RAFT to get optical flow
-        optical_flow = get_pred_flow(demo[0], frame_n, raft_model)
+        optical_flow = get_pred_flow(demo[keypoint_1], frame_n, raft_model)
         optical_flow = optical_flow.squeeze().permute(1, 2, 0)
 
         # Save RGB image 
@@ -115,8 +117,8 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model):
         plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), flow_to_image(optical_flow.cpu().numpy())) 
         plt.clf()
 
-def get_keypoint_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model):
-    generate_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model)
+def get_keypoint_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model, vid_val):
+    generate_pseudo_gt(demo, keypoint_1, keypoint_2, raft_model, vid_val)
     
 def get_flow_and_jpgs_from_video(demo_path: str):
 
@@ -133,18 +135,26 @@ def get_flow_and_jpgs_from_video(demo_path: str):
     raft_model = raft_model.module
     raft_model.to(DEVICE)
     raft_model.eval()
+    vid_val = 0
+    for dir_path in glob.glob(demo_path):
+        # breakpoint()
+        # breakpoint()
+        # category_name = os.path.basename(dir_path)
+        # match = re.search(r'\d+', dir_path)
+        # if match:
+        #     number = match.group()
+        demo = convert_vid_to_rgbs(f"{dir_path}")
+        breakpoint()
+        # Get keypoints
+        keypoints = keypoint_discovery(demo)
 
-    demo = convert_vid_to_rgbs(demo_path)
-    # breakpoint()
-    # Get keypoints
-    keypoints = keypoint_discovery(demo)
-
-    # For each keypoint, get pseudo ground truth
-    for keypoint_idx, keypoint in enumerate(keypoints):
-        if keypoint_idx == len(keypoints)-1:
-            get_keypoint_pseudo_gt(demo, keypoint, len(demo)-1, raft_model)
-        else:
-            get_keypoint_pseudo_gt(demo, keypoint, keypoints[keypoint_idx+1], raft_model)
-        
-get_flow_and_jpgs_from_video(demo_path="/home/jess/Downloads/jess_conditioner.mp4")
+        # For each keypoint, get pseudo ground truth
+        for keypoint_idx, keypoint in enumerate(keypoints):
+            if keypoint_idx == len(keypoints)-1:
+                get_keypoint_pseudo_gt(demo, keypoint, len(demo)-1, raft_model, vid_val)
+            else:
+                get_keypoint_pseudo_gt(demo, keypoint, keypoints[keypoint_idx+1], raft_model, vid_val)
+            vid_val+=1
+                
+get_flow_and_jpgs_from_video(demo_path="/home/jess/Downloads/TEA/5.mp4")
     
