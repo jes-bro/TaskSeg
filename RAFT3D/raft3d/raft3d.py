@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gc
+
 # lietorch for tangent space backpropogation
 from lietorch import SE3
 
@@ -129,9 +129,9 @@ class RAFT3D(nn.Module):
     def features_and_correlation(self, image1, image2):
         # extract features and build correlation volume
         fmap1, fmap2 = self.fnet([image1, image2])
-        # breakpoint()
+
         corr_fn = CorrBlock(fmap1, fmap2, radius=self.corr_radius)
-        
+
         # extract context features using Resnet50
         net_inp = self.cnet(image1)
         net, inp = net_inp.split([128, 128*3], dim=1)
@@ -189,8 +189,6 @@ class RAFT3D(nn.Module):
 
                     flow_est_list.append(flow2d_est)
                     flow_rev_list.append(flow2d_rev)
-                corr.detach()
-                inp.detach()
             if train_mode:
                 return flow_est_list, flow_rev_list
             Ts_up = se3_field.upsample_se3(Ts, mask)

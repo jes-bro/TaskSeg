@@ -7,7 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 # breakpoint()
-from load_flows import load_rgb_and_flow_from_directory
+from skimage.transform import resize
+from load_flows import load_rgb_and_flow_from_directory_no_resize, load_rgb_and_flow_from_directory
 from flow_viz import flow_to_image
 from datetime import datetime
 import cv2
@@ -41,8 +42,8 @@ def get_max_flow_singular(flow_uv, clip_flow=None, convert_to_bgr=False):
     v = flow_uv[:,:,1]
     rad = np.sqrt(np.square(u) + np.square(v))
     rad_max = np.max(rad)
-    # print("rad_max",rad_max) # stack wine 85.07742
-    # print("rad_average", np.average(rad)) # stack wine 3.681587
+    # print("rad_max",rad_max) # stack LIGHT 85.07742
+    # print("rad_average", np.average(rad)) # stack LIGHT 3.681587
     return rad_max
 
 def get_seq_norm_flow(flow, max_flow):
@@ -97,7 +98,7 @@ def calculate_centroid(binary_mask):
     return (cX, cY)
 
 
-def connected_components(dilated_gt_seg, gripper_pos, category_name, max_distance = 200):
+def connected_components(dilated_gt_seg, gripper_pos, category_name, max_distance = 600):
     # Use connected components to get closest segments to gripper
     num_labels, labels, _, centroids = cv2.connectedComponentsWithStats(dilated_gt_seg)
     label_dir = os.path.join('tsg', f'labels', category_name) 
@@ -570,7 +571,7 @@ def connected_components(dilated_gt_seg, gripper_pos, category_name, max_distanc
 base_directory = '/home/jess/TaskSeg/tsg/jpgs'
 
 # Use glob to find all directories that start with "12"
-pattern = os.path.join(base_directory, 'U2*')
+pattern = os.path.join(base_directory, 'LIGHT*')
 
 # Iterate over each matching directory
 val = 0
@@ -578,7 +579,7 @@ for dir_path in glob.glob(pattern):
     if os.path.isdir(dir_path):
         category_name = os.path.basename(dir_path)
         # breakpoint()
-        rgb_images, flow_data = load_rgb_and_flow_from_directory(category_name)
+        rgb_images, flow_data = load_rgb_and_flow_from_directory_no_resize(category_name)
         # breakpoint()
         parts = dir_path.split('-')
         start_frame = int(parts[3])
@@ -588,8 +589,21 @@ for dir_path in glob.glob(pattern):
         mag_sum = np.zeros((rgb_images[0].shape[0], rgb_images[0].shape[1]))
 
         robot_seg = np.load(f'/home/jess/TaskSeg/tsg/robot_seg/{category_name}/00000.npy')
+        # robot_seg = resize(robot_seg,(400, 400), preserve_range=True, anti_aliasing=True)
         gripper_pos = np.load(f'/home/jess/TaskSeg/tsg/gripper/{category_name}/00000.npy')
+        # original_size = 1280
+        # new_size = 400
+        # scaling_factor = new_size / original_size
+
+        # Scale the gripper positions
+        # gripper_pos = gripper_pos * scaling_factor
         pcd_1 = np.load(f'/home/jess/TaskSeg/tsg/pcl/{category_name}/00000.npy')
+        # original_size = 1280
+        # new_size = 400
+        # scaling_factor = new_size / original_size
+
+        # Scale the point cloud positions
+        # pcd_1 = pcd_1 * scaling_factor
         # Sequence level norm at flow, frame level norm 
         max_flow = -1000
         for idx in frame_range:
@@ -713,7 +727,140 @@ for dir_path in glob.glob(pattern):
         final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, category_name)
         
 
-        non_zero_coords = np.nonzero(final_gt_seg_l)
+        non_zero_coords = np.nonzero(dilated_gt_seg_loose)
+        
+        if non_zero_coords[0].size != 0:
+            # Bounding box coordinates
+            y_min, x_min = np.min(non_zero_coords[0]), np.min(non_zero_coords[1])
+            y_max, x_max = np.max(non_zero_coords[0]), np.max(non_zero_coords[1])
+            # Width and height of the bounding box
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            plt.imshow(rgb_images[0])
+            plt.imshow(dilated_gt_seg_loose, alpha=0.5)
+            plt.grid(False)
+            plt.axis('off')
+            # plt.plot([x_min, x_min], [y_min, y_max], color='red')
+            # plt.plot([x_max, x_max], [y_min, y_max], color='red')
+            # plt.plot([x_min, x_max], [y_min, y_min], color='red')
+            # plt.plot([x_min, x_max], [y_max, y_max], color='red')
+            # plt.plot(x_center, y_center, 'r*', markersize=16)
+            cat = "LIGHT"
+            print(f'x: {x_center}, y: {y_center}')
+            os.makedirs(f'final_masks-5/segs/{category_name}', exist_ok=True) 
+            os.makedirs(f'final_masks-5/segs/{cat}', exist_ok=True) 
+            os.makedirs(f'final_masks-5/images/{cat}', exist_ok=True) 
+            os.makedirs(f'final_masks-5/gt_bboxs/{cat}', exist_ok=True) 
+            np.save(f'final_masks-5/gt_bboxs/{cat}/{val}.npy', np.array([x_min, y_min, x_max, y_max]))
+            plt.savefig(f'final_masks-5/segs/{cat}/{val}.png')
+            np.save(f'final_masks-5/segs/{category_name}/00001.npy', dilated_gt_seg_loose)
+            plt.clf()
+            plt.imsave(f'final_masks-5/segs/{category_name}/00001.png', rgb_images[0])
+            val+=1
+        else:
+            print("something is wrong")
+
+####################################################################################################################################################
+# Exp 5 Sequence level norm followed by frame level norm, sequence level outlier removal
+base_directory = '/home/jess/TaskSeg/tsg/jpgs'
+
+# Use glob to find all directories that start with "12"
+pattern = os.path.join(base_directory, 'LIGHT*')
+
+# Iterate over each matching directory
+val = 0
+for dir_path in glob.glob(pattern):
+    if os.path.isdir(dir_path):
+        category_name = os.path.basename(dir_path)
+        # breakpoint()
+        rgb_images, flow_data = load_rgb_and_flow_from_directory(category_name)
+        # breakpoint()
+        parts = dir_path.split('-')
+        start_frame = int(parts[3])
+        end_frame = float(parts[4])
+        frame_range = range(int(start_frame), int(end_frame + 1))
+
+        mag_sum = np.zeros((rgb_images[0].shape[0], rgb_images[0].shape[1]))
+
+        robot_seg = np.load(f'/home/jess/TaskSeg/tsg/robot_seg/{category_name}/00000.npy')
+        robot_seg = cv2.resize(robot_seg, (400, 400), interpolation=cv2.INTER_CUBIC)
+        gripper_pos = np.load(f'/home/jess/TaskSeg/tsg/gripper/{category_name}/00000.npy')
+        original_size = 1280
+        new_size = 400
+        scaling_factor = new_size / original_size
+
+        # Scale the gripper positions
+        gripper_pos = gripper_pos * scaling_factor
+        pcd_1 = np.load(f'/home/jess/TaskSeg/tsg/pcl/{category_name}/00000.npy')
+        # original_size = 1280
+        # new_size = 400
+        # scaling_factor = new_size / original_size
+
+        # Scale the point cloud positions
+        pcd_1 = cv2.resize(pcd_1, (400, 400), interpolation=cv2.INTER_CUBIC)
+        # Sequence level norm at flow, frame level norm 
+        max_flow = -1000
+        for idx in frame_range:
+            value = idx - frame_range.start
+            curr_max = get_max_flow_singular(flow_data[idx - frame_range.start])
+            nn_save_dir = os.path.join('tsg', f'no_norm_flows', category_name) 
+            os.makedirs(nn_save_dir, exist_ok=True) 
+            plt.imsave(os.path.join(nn_save_dir, f'{category_name}-{value}.png'), flow_to_image(flow_data[idx - frame_range.start]) / 255.0)
+            if curr_max > max_flow:
+                max_flow = curr_max
+
+        for idx in frame_range:
+            value = idx - frame_range.start
+            optical_flow = get_seq_norm_flow(flow_data[idx - frame_range.start], max_flow)
+            fl_save_dir = os.path.join('tsg', f'seq_norm_flows', category_name) 
+            os.makedirs(fl_save_dir, exist_ok=True) 
+            plt.imsave(os.path.join(fl_save_dir, f'{category_name}-{value}.png'), flow_to_image(optical_flow) / 255.0)
+            magnitudes = get_flow_magnitudes(optical_flow)
+            # breakpoint()
+            mag_no_robot = np.multiply(magnitudes, robot_seg)
+            if mag_no_robot.max() > 0:
+                curr_mag = mag_no_robot/np.max(mag_no_robot)
+                framemag_save_dir = os.path.join('tsg', f'seq_and_frame_norm_mag', category_name) 
+                os.makedirs(framemag_save_dir, exist_ok=True) 
+                plt.imsave(os.path.join(framemag_save_dir, f'{category_name}-{value}.png'), curr_mag)
+                mag_sum += curr_mag
+
+        # save the mags
+        mag_save_dir = os.path.join('tsg', f'magnitudes_seq_norm_at_flow_frame_at_mag_seq_outlier_rem', category_name) 
+        os.makedirs(mag_save_dir, exist_ok=True) 
+        plt.imsave(os.path.join(mag_save_dir, f'{category_name}.png'), mag_sum)
+        np.save(os.path.join(mag_save_dir, f'{category_name}.npy'), mag_sum)
+
+
+        # Compute the average magnitude over the frame range
+        norm_mag_sum = mag_sum / len(frame_range)
+
+        data = norm_mag_sum.flatten()
+        mean = np.mean(data)
+        median = np.median(data)
+        std = np.std(data)
+
+        kernel = np.ones((5, 5), np.uint8)
+        ground_truth_seg_loose = (norm_mag_sum >= mean + 4 * std).astype(np.uint8)
+        eroded_gt_seg_loose = cv2.erode(ground_truth_seg_loose, kernel, iterations=1)
+        dilated_gt_seg_loose = cv2.dilate(eroded_gt_seg_loose, kernel, iterations=1)
+
+        seg_save_dir = os.path.join('tsg', 'final_seg-5', category_name)
+        os.makedirs(seg_save_dir, exist_ok=True)
+        plt.imsave(os.path.join(seg_save_dir, f'{0:05}.png'), dilated_gt_seg_loose)
+        plt.clf()
+        plt.figure(figsize=(16.63, 16.63))
+        count = (dilated_gt_seg_loose == 1).sum()
+        x_center, y_center = calculate_centroid(dilated_gt_seg_loose)#np.argwhere(dilated_gt_seg_loose==1).sum(0)/count
+        for i in range(ground_truth_seg_loose.shape[0]):
+            for j in range(ground_truth_seg_loose.shape[1]):
+                if pcd_1[i][j][0] < -0.6 or pcd_1[i][j][0] > 0.6 or pcd_1[i][j][1] < -0.6 or pcd_1[i][j][1] > 0.6 or pcd_1[i][j][2] < 0.7525: #-0.5, 0.52, -0.55, 0.55
+                    dilated_gt_seg_loose[i][j] = 0  
+        # breakpoint()
+        final_gt_seg_l = connected_components(dilated_gt_seg_loose, gripper_pos, category_name)
+        
+
+        non_zero_coords = np.nonzero(dilated_gt_seg_loose)
 
         if non_zero_coords[0].size != 0:
             # Bounding box coordinates
@@ -723,7 +870,7 @@ for dir_path in glob.glob(pattern):
             width = x_max - x_min + 1
             height = y_max - y_min + 1
             plt.imshow(rgb_images[0])
-            plt.imshow(final_gt_seg_l, alpha=0.5)
+            plt.imshow(dilated_gt_seg_loose, alpha=0.5)
             plt.grid(False)
             plt.axis('off')
             # plt.plot([x_min, x_min], [y_min, y_max], color='red')
@@ -731,15 +878,19 @@ for dir_path in glob.glob(pattern):
             # plt.plot([x_min, x_max], [y_min, y_min], color='red')
             # plt.plot([x_min, x_max], [y_max, y_max], color='red')
             # plt.plot(x_center, y_center, 'r*', markersize=16)
+            # cat = "UMB"
             print(f'x: {x_center}, y: {y_center}')
-            os.makedirs(f'final_masks-5/segs/umbrella', exist_ok=True) 
-            os.makedirs(f'final_masks-5/images/umbrella', exist_ok=True) 
-            os.makedirs(f'final_masks-5/gt_bboxs/umbrella', exist_ok=True) 
-            np.save(f'final_masks-5/gt_bboxs/umbrella/{val}.npy', np.array([x_min, y_min, x_max, y_max]))
-            np.save(f'final_masks-5/segs/umbrella/{val}.npy', final_gt_seg_l)
+            os.makedirs(f'final_masks-5/segs/{category_name}', exist_ok=True) 
+            os.makedirs(f'final_masks-5/images/{cat}', exist_ok=True) 
+            os.makedirs(f'final_masks-5/gt_bboxs/{cat}', exist_ok=True) 
+            # np.save(f'final_masks-5/gt_bboxs/{cat}/{val}.npy', np.array([x_min, y_min, x_max, y_max]))
+            # plt.savefig(f'final_masks-5/segs/{cat}/{val}.png')
+            np.save(f'final_masks-5/segs/{category_name}/00000.npy', dilated_gt_seg_loose)
             plt.clf()
-            plt.imsave(f'final_masks-5/images/umbrella/{val}.png', rgb_images[0])
+            plt.imsave(f'final_masks-5/segs/{category_name}/00000.png', rgb_images[0])
             val+=1
+        else: 
+            print("something went wrong part 2")
 ###########################################################################################################################################
 # Exp 6: Frame level outlier removal, frame level norm (flow level)
 

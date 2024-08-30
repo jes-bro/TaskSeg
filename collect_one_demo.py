@@ -195,7 +195,7 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
 
     # Save robot segmentation
     fstop = frame_range.stop - 1
-    category_name = f"U-inf-same-{camera_view}-{frame_range.start}-{fstop}-{str(datetime.now())}"
+    category_name = f"2TASK-same-{camera_view}-{frame_range.start}-{fstop}-{str(datetime.now())}"
     value = 0
     robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
     os.makedirs(robot_save_dir, exist_ok=True) 
@@ -309,7 +309,7 @@ if __name__ == '__main__':
     breakpoint()
     # TASKS = [PhoneOnBase, StackWine, InsertOntoSquarePeg, PlaceShapeInShapeSorter, CloseBox, PlaceCups, SweepToDustpan, OpenDoor, HitBallWithQueue, ScoopWithSpatula, InsertUsbInComputer]
     print(TASKS)
-    SAMPLES = 1
+    SAMPLES = 12
 
     start_time = datetime.now()
 

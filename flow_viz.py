@@ -203,6 +203,6 @@ def flow_to_image(flow_uv, clip_flow=None, convert_to_bgr=False):
     rad = np.sqrt(np.square(u) + np.square(v))
     rad_max = np.max(rad)
     epsilon = 1e-5
-    # u = u / (rad_max + epsilon)
-    # v = v / (rad_max + epsilon)
+    u = u / (rad_max + epsilon)
+    v = v / (rad_max + epsilon)
     return flow_uv_to_colors(u, v, convert_to_bgr)

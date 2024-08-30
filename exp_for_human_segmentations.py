@@ -109,7 +109,7 @@ def connected_components(dilated_gt_seg, hand_seg, category_name, max_distance =
     # breakpoint()
     hand_center_x = hand_seg[0]
     hand_center_y = hand_seg[1]
-    plt.plot(hand_center_x,hand_center_y,'ro',markersize=16)
+    # plt.plot(hand_center_x,hand_center_y,'ro',markersize=16)
     plt.savefig(os.path.join(label_dir, f'{category_name}.png'))
 
     filtered_labels = np.zeros_like(labels, dtype=np.uint8)

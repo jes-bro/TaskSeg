@@ -134,22 +134,40 @@ DEPTH_SCALE = 0.2
 def prepare_images_and_depths(image1, image2, depth1, depth2):
     """ padding, normalization, and scaling """
 
-    print(f"Original depth1 shape: {depth1.shape}")
-    print(f"Original depth2 shape: {depth2.shape}")
-
     image1 = F.pad(image1, [0,0,0,0], mode='replicate')
     image2 = F.pad(image2, [0,0,0,0], mode='replicate')
     depth1 = F.pad(depth1[:,None], [0,0,0,0], mode='replicate')[:,0]
     depth2 = F.pad(depth2[:,None], [0,0,0,0], mode='replicate')[:,0]
-    
+
     depth1 = (DEPTH_SCALE * depth1).float()
     depth2 = (DEPTH_SCALE * depth2).float()
     image1 = normalize_image(image1)
     image2 = normalize_image(image2)
-    print(f"New depth1 shape: {depth1.shape}")
-    print(f"New depth2 shape: {depth2.shape}")
+
     return image1, image2, depth1, depth2
 
+
+def display(img, tau, phi):
+    """ display se3 fields """
+    fig, (ax1, ax2, ax3) = plt.subplots(1,3)
+    ax1.imshow(img[:, :, ::-1] / 255.0)
+
+    tau_img = np.clip(tau, -0.1, 0.1)
+    tau_img = (tau_img + 0.1) / 0.2
+
+    phi_img = np.clip(phi, -0.1, 0.1)
+    phi_img = (phi_img + 0.1) / 0.2
+
+    ax2.imshow(tau_img)
+    ax3.imshow(phi_img)
+    plt.show()
+
+def get_flow_magnitudes3d(flow):
+    u = flow[:,:,0]
+    v = flow[:,:,1]
+    w = flow[:,:,2]
+    rad = np.sqrt(np.square(u) + np.square(v) + np.square(w))
+    return rad
 
 def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
     gripper_pos = demo[keypoint_1].gripper_pose[:3]
@@ -189,7 +207,7 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
 
     # Save robot segmentation
     fstop = frame_range.stop - 1
-    category_name = f"MONEY3D-same-{camera_view}-{frame_range.start}-{fstop}"
+    category_name = f"MON3DFIXED-same-{camera_view}-{frame_range.start}-{fstop}"
     value = 0
     robot_save_dir = os.path.join('tsg', 'robot_seg', category_name) 
     os.makedirs(robot_save_dir, exist_ok=True) 
@@ -227,10 +245,14 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         print(depth_1.shape)
         # breakpoint()
         Ts = raft_model(image1, image2, depth1, depth2, intrinsics)
-    
+        # breakpoint()
         # compute 2d and 3d from from SE3 field (Ts)
         flow2d, flow3d, _ = pops.induced_flow(Ts, depth1, intrinsics)
-        optical_flow = flow3d / DEPTH_SCALE
+        flow_mags = get_flow_magnitudes3d(flow3d.squeeze().detach().cpu().numpy())
+        breakpoint()
+        plt.imshow(flow_mags)
+        plt.show()
+        optical_flow = flow3d
         optical_flow = optical_flow.squeeze(0).detach().cpu().numpy()
         # breakpoint()
         # optical_flow = optical_flow.transpose(1,2,0)
@@ -251,15 +273,7 @@ def generate_pseudo_gt(demo, keypoint_1, keypoint_2, camera_view):
         # os.makedirs(flow_save_dir, exist_ok=True) 
         # plt.imsave(os.path.join(flow_save_dir, f'{value:05}.jpg'), optical_flow / 255.0) 
         # plt.clf()
-        gc.collect()
-        torch.cuda.empty_cache()
-        del depth1
-        del depth2
-        del image1
-        del image2
-        del intrinsics
-        del Ts
-        torch.cuda.synchronize()
+        # extract rotational and translational components of Ts
 
     final_gt_seg_l = 1
     final_gt_seg_t = 1
@@ -344,7 +358,7 @@ if __name__ == '__main__':
     device = torch.device("cuda:0")
     # Set up RAFT model
     raft_3D = importlib.import_module('RAFT3D.raft3d.raft3d').RAFT3D
-    raft_model = raft_3D(args)
+    raft_model = torch.nn.DataParallel(raft_3D(args))
     raft_model.load_state_dict(torch.load(args.model), strict=False)
     raft_model.eval()
     raft_model.to(device)

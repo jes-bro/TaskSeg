@@ -138,7 +138,9 @@ def connected_components(dilated_gt_seg, gripper_pos, image, max_distance = 0.1)
         connected_component = np.column_stack(np.where(labeled_image == label))
         for point in connected_component:
             # Calculate the distance between the gripper and point cloud of pixel
-            distance = np.linalg.norm(gripper_pos - image[0][1])
+            pixel_pos = np.array([point[0], point[1], 0])
+            distance = np.linalg.norm(gripper_pos - pixel_pos)
+            breakpoint()
             if distance <= max_distance:
                 close_segments.append(label)
                 break
